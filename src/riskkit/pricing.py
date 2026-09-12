@@ -7,12 +7,18 @@ Units and conventions
   on a 365-day calendar, the same conventions as deskboard's `engine/greeks.py`.
 - Spot shocks are log returns (S' = S * exp(x)); vol shocks are absolute changes in the
   option's implied vol (0.01 = one vol point); a time step of `days` moves T by days/365.
-- P&L is value(after) - value(before), positive = gain.
+- P&L is value(after) - value(before), positive = gain, where value(before) is the model
+  price at the leg's own marked (spot, iv, T) — for an option marked at a quote mid this is
+  the Black-Scholes price at the inverted implied vol (equal to the mid to solver tolerance),
+  and for a mid with no implied vol (NO_IV) it is the price at the fallback vol. So a
+  scenario's P&L is a function of the shock only, and zero shock is exactly zero P&L for
+  every leg; a quote-vs-model gap never enters a scenario as a constant.
 
-`price`, `greeks`, `implied_vol` have the same signatures as deskboard's pricer, so the
-`pricers` sibling repo (or a surface pricer) is a drop-in: only these three names are used
-outside this module, plus `price_vec`, the array form of `price` used by the scenario
-engines. The scalar three are copied verbatim from deskboard.
+`price`, `greeks`, `implied_vol` have the same signatures as deskboard's pricer, and
+`price_vec` is the array form of `price` that the scenario engines call: a surface pricer
+that provides these four names is a drop-in (replacing only the scalar three changes the
+marks and the parametric Greeks, not the full-revaluation engines). The scalar three are
+copied verbatim from deskboard.
 """
 
 from __future__ import annotations
@@ -118,7 +124,9 @@ def revalue(marks, spot_shock, vol_shock, days: float = 0.0, r: float = 0.0, q: 
 def revalue_factors(marks, spot_shocks: dict[str, np.ndarray], vol_shocks: dict[str, np.ndarray],
                     days: float = 0.0, r: float = 0.0, q: float = 0.0) -> np.ndarray:
     """Full revaluation with one (spot, vol) shock series per underlying symbol. Every array
-    in `spot_shocks` / `vol_shocks` has the same length n; returns book P&L of shape (n,)."""
+    in `spot_shocks` / `vol_shocks` has the same length n; returns book P&L of shape (n,).
+    Each leg's P&L is price(shocked) - price(marked inputs), both from `price_vec`, so the
+    zero-shock P&L is exactly zero even for a leg whose `value` is a quote mid."""
     pnl = None
     for m in marks:
         x = np.asarray(spot_shocks[m.symbol], dtype=float)
@@ -126,10 +134,11 @@ def revalue_factors(marks, spot_shocks: dict[str, np.ndarray], vol_shocks: dict[
         if m.sec_type == "OPT":
             y = np.asarray(vol_shocks[m.symbol], dtype=float)
             T1 = max(0.0, m.T - days / YEAR)
+            v0 = price_vec(np.asarray(m.spot), m.strike, m.T, np.asarray(m.iv), m.right, r, q)
             v1 = price_vec(S1, m.strike, T1, m.iv + y, m.right, r, q)
         else:  # STK / FUT: linear in the spot factor
-            v1 = S1
-        leg = (v1 - m.value) * m.sq * m.mult
+            v0, v1 = m.spot, S1
+        leg = (v1 - v0) * m.sq * m.mult
         pnl = leg if pnl is None else pnl + leg
     if pnl is None:
         n = len(next(iter(spot_shocks.values()))) if spot_shocks else 1

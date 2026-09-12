@@ -84,6 +84,42 @@ def test_christoffersen_independence_rejects_clustered_and_accepts_iid():
     assert cc.statistic == pytest.approx(cc.details["lr_pof"] + cc.details["lr_ind"], rel=1e-12)
 
 
+def test_christoffersen_cc_simulated_p_value_size_and_power_at_250_days():
+    """At 250 days / 99 % the chi2(2) rule is nearly silent: on 400 i.i.d. samples it rejects ~0.5 %
+    (nominal 5 %). The default simulated p-value (exact i.i.d. Bernoulli null, 500 sims) has size
+    <= 6 % and more power against Markov-clustered exceptions (p11 = 0.3) than the asymptotic rule at
+    the same 250 days; at 2,000 days it rejects the clustered chain > 90 %. The statistic and the
+    asymptotic p-value are unchanged and carried in `details`."""
+    rng = np.random.default_rng(3)
+    p11 = 0.3
+    p01 = 0.01 * (1 - p11) / 0.99
+    iid = _iid_exceptions(rng, 250, 0.01, 400)
+    clustered = _markov_exceptions(rng, 250, p11, p01, 400)
+    sim_size = np.mean([bt.christoffersen_cc(e, 0.99, n_sim=500, seed=i).reject for i, e in enumerate(iid)])
+    asym_size = np.mean([bt.christoffersen_cc(e, 0.99, n_sim=0).reject for e in iid])
+    assert asym_size < 0.02 and sim_size <= 0.06
+    sim_power = np.mean([bt.christoffersen_cc(e, 0.99, n_sim=500, seed=i).reject for i, e in enumerate(clustered)])
+    asym_power = np.mean([bt.christoffersen_cc(e, 0.99, n_sim=0).reject for e in clustered])
+    assert sim_power > asym_power and sim_power > 0.30
+    long = _markov_exceptions(rng, 2000, p11, p01, 100)
+    assert np.mean([bt.christoffersen_cc(e, 0.99, n_sim=300, seed=i).reject for i, e in enumerate(long)]) > 0.90
+    r, r0 = bt.christoffersen_cc(clustered[0], 0.99), bt.christoffersen_cc(clustered[0], 0.99, n_sim=0)
+    assert r.statistic == r0.statistic and r.details["p_asymptotic"] == r0.p_value and r0.details["n_sim"] == 0
+
+
+def test_christoffersen_worked_example_240_4_4_2():
+    """Transition counts 240/4/4/2 (251 observations, 6 exceptions): LR_ind = 8.152; LR_pof over all
+    T = 251 observations = 3.527, so LR_cc = 11.679 (a reference using T-1 = 250 for both gets 11.707)."""
+    e = np.zeros(251, bool)
+    e[[10, 11, 12, 100, 150, 200]] = True   # 1,1,1 gives n11 = 2 and n01 = 4 with three isolated exceptions
+    r = bt.christoffersen_independence(e)
+    assert (r.details["n00"], r.details["n01"], r.details["n10"], r.details["n11"]) == (240, 4, 4, 2)
+    assert r.statistic == pytest.approx(8.152, abs=1e-3)
+    cc = bt.christoffersen_cc(e, 0.99, n_sim=0)
+    assert cc.details["lr_pof"] == pytest.approx(3.527, abs=1e-3) and cc.statistic == pytest.approx(11.679, abs=1e-3)
+    assert float(bt.kupiec_lr(6, 250, 0.01)) + r.statistic == pytest.approx(11.707, abs=1e-3)
+
+
 def test_christoffersen_transition_counts():
     e = np.array([0, 1, 1, 0, 0, 1, 0], bool)
     r = bt.christoffersen_independence(e)
@@ -101,6 +137,18 @@ def test_traffic_light_zone_boundaries_at_250_days_99_percent():
         assert bt.traffic_light(x).verdict == "red" and bt.traffic_light(x).reject
     assert bt.traffic_light(4).details["cumulative_probability"] == pytest.approx(0.8922, abs=1e-3)
     assert bt.traffic_light(5).details["cumulative_probability"] == pytest.approx(0.9588, abs=1e-3)
+
+
+def test_traffic_light_exact_size_and_power():
+    """P(not green | accurate 99 % model) = P(x >= 5) = 0.108 exactly (Binomial(250, 0.01)); against a
+    true 3 % rate it is 0.872. 400 simulated samples of each land within 4 points."""
+    from scipy.stats import binom
+
+    rng = np.random.default_rng(7)
+    assert binom.sf(4, 250, 0.01) == pytest.approx(0.1078, abs=5e-4) and binom.sf(4, 250, 0.03) == pytest.approx(0.8718, abs=5e-4)
+    acc = np.mean([bt.traffic_light(int(e.sum())).verdict != "green" for e in _iid_exceptions(rng, 250, 0.01, 400)])
+    bad = np.mean([bt.traffic_light(int(e.sum())).verdict != "green" for e in _iid_exceptions(rng, 250, 0.03, 400)])
+    assert acc == pytest.approx(0.108, abs=0.04) and bad == pytest.approx(0.872, abs=0.04)
 
 
 def test_acerbi_szekely_accepts_true_es_and_rejects_es_30_percent_too_small():
@@ -126,6 +174,29 @@ def test_acerbi_szekely_accepts_true_es_and_rejects_es_30_percent_too_small():
     assert np.mean(heavy) >= 0.70
 
 
+def test_acerbi_szekely_gaussian_sampler_over_rejects_a_correct_fat_tailed_model_and_own_sampler_does_not():
+    """Truth and model both Student-t(4) with the true 99 % VaR and ES (ES/VaR = 1.39, Gaussian 1.15).
+    The default Gaussian sampler's null has E[Z2] = 1 - ES_gauss/ES_t4 > 0, so it rejects the correct
+    model ~10 % of the time at 250 days (and more at longer T); `scenario_sampler` built from the
+    model's own scenario set rejects <= 6 %. 200 samples each, paired."""
+    from scipy.stats import t as student
+
+    nu = 4
+    q = student.ppf(0.99, nu)
+    es = (nu + q**2) / (nu - 1) * student.pdf(q, nu) / 0.01
+    rng = np.random.default_rng(11)
+    scen = rng.standard_t(nu, 20_000)                       # the model's own scenario P&L
+    own = bt.scenario_sampler(scen, np.full(250, q), q)
+    gauss, mine = [], []
+    for i in range(200):
+        x = rng.standard_t(nu, 250)
+        gauss.append(bt.acerbi_szekely_z2(x, q, es, 0.99, n_sim=200, seed=i).reject)
+        mine.append(bt.acerbi_szekely_z2(x, q, es, 0.99, sampler=own, n_sim=200, seed=i).reject)
+    assert np.mean(mine) <= 0.06 and np.mean(gauss) >= 0.07 and np.mean(gauss) > np.mean(mine)
+    draws = own(np.random.default_rng(0), 5)
+    assert draws.shape == (5, 250) and set(np.unique(draws)) <= set(scen)
+
+
 def test_acerbi_szekely_statistic_is_zero_in_expectation_under_h0():
     rng = np.random.default_rng(5)
     z = [bt.acerbi_szekely_z2(rng.standard_normal(2000), Z99, ES99, 0.99, n_sim=50, seed=i).statistic for i in range(200)]
@@ -133,17 +204,28 @@ def test_acerbi_szekely_statistic_is_zero_in_expectation_under_h0():
 
 
 def test_engle_manganelli_dq_size_and_power():
-    """i.i.d. exceptions: reject rate <= 0.12 over 150 samples of 1,000 days (nominal 5 %); Markov-clustered
-    exceptions (p11 = 0.3) over 2,000 days: reject rate > 0.9."""
+    """Gaussian P&L with the true 99 % VaR. The chi2 rule rejects a correct model 16 % of the time at
+    500 days and 8-11 % elsewhere (measured on 4,000 samples), so the default p-value is simulated
+    under the exact i.i.d. Bernoulli(p) null: on 300 samples each at 250 and 500 days (200 sims) the
+    rejection rate is 5 % +- 3; the asymptotic rule at 500 days is >= 10 %. Markov-clustered exceptions
+    (p11 = 0.3) over 2,000 days: reject rate > 0.9. With a constant VaR its column is the intercept and
+    df = 5; with a time-varying VaR df = 6."""
     rng = np.random.default_rng(6)
-    pnl = rng.standard_normal((150, 1000))
-    size = np.mean([bt.engle_manganelli_dq(row, Z99, 0.99).reject for row in pnl])
-    assert size <= 0.12
+    for T in (250, 500):
+        pnl = rng.standard_normal((300, T))
+        size = np.mean([bt.engle_manganelli_dq(row, Z99, 0.99, n_sim=200, seed=i).reject for i, row in enumerate(pnl)])
+        assert 0.02 <= size <= 0.08, (T, size)
+        if T == 500:
+            assert np.mean([bt.engle_manganelli_dq(row, Z99, 0.99, n_sim=0).reject for row in pnl]) >= 0.10
     p11 = 0.3
-    exc = _markov_exceptions(rng, 2000, p11, 0.01 * (1 - p11) / 0.99, 150)
+    exc = _markov_exceptions(rng, 2000, p11, 0.01 * (1 - p11) / 0.99, 100)
     fake_pnl = np.where(exc, -Z99 - 1.0, 0.0)  # a loss beyond VaR exactly where the chain says
-    power = np.mean([bt.engle_manganelli_dq(row, Z99, 0.99).reject for row in fake_pnl])
+    power = np.mean([bt.engle_manganelli_dq(row, Z99, 0.99, n_sim=100, seed=i).reject for i, row in enumerate(fake_pnl)])
     assert power > 0.90
+    r = bt.engle_manganelli_dq(pnl[0], Z99, 0.99, n_sim=0)
+    assert r.details["df"] == 5 and r.p_value == r.details["p_asymptotic"]
+    sig = np.exp(rng.normal(0, 0.3, 500))
+    assert bt.engle_manganelli_dq(sig * rng.standard_normal(500), sig * Z99, 0.99, n_sim=0).details["df"] == 6
 
 
 def test_suite_returns_six_named_results():

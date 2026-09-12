@@ -10,14 +10,17 @@ answered as code contracts, each with a named test in tests/test_edge_cases.py:
    widened with the lock move continuing (1x, 2x, 3x the lock move with the vol factor
    responding by its historical beta), and VaR / ES are never allowed to fall below the last
    unlocked values — if the recomputation is lower it is frozen at the previous number with a
-   "VAR_FROZEN" flag saying why. The state is "LIMIT_DOWN".
+   "VAR_FROZEN" flag saying why. The state is "LIMIT_DOWN" (or "LIMIT_UP" for a positive lock
+   move; the contract is the same).
 3. Stale quote (`test_stale_quote_marks_to_last_valid_mid_and_flags`): a leg whose latest
    valid quote is older than `stale_after` is marked at that last valid mid and flagged
    "STALE_QUOTE" with its age; a quote whose mid has no implied vol is flagged "NO_IV" and
    the leg's vol falls back to the underlying's level. The state is "STALE".
 
-State precedence: EMPTY > LIMIT_DOWN > STALE > OK. Flags carry (kind, subject, reason) so the
-report can print the sentence a trader acts on.
+State precedence: EMPTY > LIMIT_DOWN / LIMIT_UP > STALE > OK. Flags carry (kind, subject,
+reason) so the report can print the sentence a trader acts on. `RiskAssessment.market` is the
+market the marks and the numbers were computed on (the last valid mid under a lock), so a
+report prints the spot the numbers refer to, not the locked print.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from . import pricing as bs
 from .positions import Book, LegMark, Market, contract_key, mark
 from .var import VaRResult, historical_var
 
-STATES = ("OK", "EMPTY", "LIMIT_DOWN", "STALE")
+STATES = ("OK", "EMPTY", "LIMIT_DOWN", "LIMIT_UP", "STALE")
 DEFAULT_STALE_AFTER = pd.Timedelta(minutes=15)
 LOCK_CONTINUATIONS = (1.0, 2.0, 3.0)
 
@@ -54,7 +57,7 @@ class Quote:
 
 @dataclass(frozen=True)
 class Flag:
-    kind: str       # EMPTY | LIMIT_DOWN | VAR_FROZEN | STALE_QUOTE | NO_IV
+    kind: str       # EMPTY | LIMIT_DOWN | LIMIT_UP | VAR_FROZEN | STALE_QUOTE | NO_IV
     subject: str    # contract key, symbol or "book"
     reason: str
 
@@ -74,6 +77,7 @@ class RiskAssessment:
     var: VaRResult
     flags: tuple[Flag, ...]
     marks: tuple[LegMark, ...]
+    market: Market           # the market the marks and `var` were computed on (last valid mid under a lock)
 
 
 def latest_valid_quote(quotes: list[Quote]) -> Quote | None:
@@ -135,7 +139,7 @@ def assess(book: Book, market: Market, history: pd.DataFrame, confidence: float 
     below it."""
     if book.is_empty():
         zero = VaRResult("historical", confidence, horizon_days, 0.0, 0.0, 0, ("EMPTY",), np.zeros(0))
-        return RiskAssessment("EMPTY", zero, (Flag("EMPTY", "book", "book has no legs: zero risk is a state to explain, not a result"),), ())
+        return RiskAssessment("EMPTY", zero, (Flag("EMPTY", "book", "book has no legs: zero risk is a state to explain, not a result"),), (), market)
     flags: list[Flag] = []
     mkt = market
     extra = None
@@ -156,5 +160,8 @@ def assess(book: Book, market: Market, history: pd.DataFrame, confidence: float 
         res = VaRResult(res.method, res.confidence, res.horizon, frozen_var, frozen_es, res.n_scenarios,
                         res.notes + ("VAR_FROZEN",), res.pnl)
     kinds = {f.kind for f in flags}
-    state = "LIMIT_DOWN" if lock is not None and lock.symbol in book.underlyings() else ("STALE" if "STALE_QUOTE" in kinds else "OK")
-    return RiskAssessment(state, res, tuple(flags), tuple(marks))
+    if "LIMIT_DOWN" in kinds or "LIMIT_UP" in kinds:
+        state = "LIMIT_DOWN" if "LIMIT_DOWN" in kinds else "LIMIT_UP"
+    else:
+        state = "STALE" if "STALE_QUOTE" in kinds else "OK"
+    return RiskAssessment(state, res, tuple(flags), tuple(marks), mkt)

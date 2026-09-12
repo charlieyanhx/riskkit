@@ -98,6 +98,48 @@ def test_stale_quote_marks_to_last_valid_mid_and_flags(demo):
     assert not ec.Quote(asof, 2.70, 2.50).valid and not ec.Quote(asof, float("nan"), 1.0).valid and ec.Quote(asof, 0.0, 0.02).valid
 
 
+def test_no_iv_quote_changes_book_value_but_not_risk(demo):
+    """A quote mid with no implied vol (a put quoted above its strike) marks the leg at the mid but the
+    scenario P&L is measured from the model price at the fallback vol: zero shock is exactly zero for
+    every leg and VaR / ES are unchanged to 1e-9 (a 0.1 % quote-vs-model gap on one leg used to enter
+    every scenario as a constant $-97,866 and move VaR from 6,277 to 104,143)."""
+    book, mkt, hist = demo
+    asof = pd.Timestamp(mkt.asof)
+    key = "SYN:20260811:490:P"
+    base = ec.assess(book, mkt, hist)
+    a = ec.assess(book, mkt, hist, quotes={key: [ec.Quote(asof - pd.Timedelta(minutes=3), 494.0, 496.0)]})
+    m = next(m for m in a.marks if m.key == key)
+    assert m.value == 495.0 and m.flags == ("NO_IV",) and a.state == "OK"
+    from riskkit.positions import book_value
+    assert book_value(list(a.marks)) != book_value(list(base.marks))
+    zero = bs.revalue_factors(a.marks, {"SYN": np.zeros(1)}, {"SYN": np.zeros(1)}, 0.0)
+    assert zero[0] == 0.0
+    assert a.var.var == pytest.approx(base.var.var, abs=1e-9) and a.var.es == pytest.approx(base.var.es, abs=1e-9)
+    assert np.array_equal(a.var.pnl, base.var.pnl)
+    # the same holds for a stale quote (marked at its mid, implied vol inverted) and a fresh one
+    quotes = {"SYN:20260727:480:P": [ec.Quote(asof - pd.Timedelta(minutes=40), 2.40, 2.60)],
+              "SYN:20260727:440:P": [ec.Quote(asof - pd.Timedelta(minutes=2), 0.05, 0.07)]}
+    b = ec.assess(book, mkt, hist, quotes=quotes)
+    assert b.state == "STALE"
+    for leg in b.marks:
+        assert bs.revalue_factors([leg], {"SYN": np.zeros(2)}, {"SYN": np.zeros(2)}, 0.0).tolist() == [0.0, 0.0]
+
+
+def test_limit_up_lock_reports_limit_up(demo):
+    """A positive lock move is the same contract with the opposite sign: state LIMIT_UP, flag LIMIT_UP,
+    continuations up, marks at the last valid mid, and the assessment carries the marked market."""
+    book, mkt, hist = demo
+    unlocked = ec.assess(book, mkt, hist)
+    up = ec.assess(book, mkt, hist, lock=ec.Lock("SYN", 500.0, math.log(1.07), mkt.asof), previous=unlocked.var)
+    assert up.state == "LIMIT_UP" and "LIMIT_UP" in ec.STATES and [f.kind for f in up.flags][0] == "LIMIT_UP"
+    assert up.var.var >= unlocked.var.var and up.var.es >= unlocked.var.es
+    assert ec.lock_scenarios(book, hist, ec.Lock("SYN", 500.0, math.log(1.07), mkt.asof))[:, 0].min() > 0
+    assert up.market.spot["SYN"] == 500.0 and unlocked.market == mkt
+    locked_print = Market(mkt.asof, {"SYN": 535.0}, mkt.vol)
+    up2 = ec.assess(book, locked_print, hist, lock=ec.Lock("SYN", 500.0, math.log(1.07), mkt.asof))
+    assert up2.market.spot["SYN"] == 500.0 and all(m.spot == 500.0 for m in up2.marks)
+
+
 def test_state_precedence_empty_over_lock_over_stale(demo):
     _, mkt, hist = demo
     lock = ec.Lock("SYN", 500.0, math.log(0.93), mkt.asof)

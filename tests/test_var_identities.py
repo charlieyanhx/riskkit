@@ -120,17 +120,86 @@ def test_cornish_fisher_tail_mean_equals_numerical_integral():
     assert not V.cornish_fisher_is_monotone(2.5, 0.0)
 
 
-def test_parametric_gamma_lowers_var_for_long_gamma_and_raises_it_for_short(demo):
-    """A long straddle has positive gamma: the delta-gamma VaR is below delta-only; short is above."""
-    _, mkt, hist = demo
-    legs = [{"symbol": SYN, "sec_type": "OPT", "expiration": "20260727", "strike": 500.0, "right": r, "side": side, "quantity": 10}
-            for r in ("C", "P") for side in ("BUY",)]
+def _straddles():
+    legs = [{"symbol": SYN, "sec_type": "OPT", "expiration": "20260727", "strike": 500.0, "right": r, "side": "BUY", "quantity": 10}
+            for r in ("C", "P")]
     long_ = Book.from_positions([{"pos_id": "L", "legs": legs}])
     short = Book.from_positions([{"pos_id": "S", "legs": [{**leg, "side": "SELL"} for leg in legs]}])
+    return long_, short
+
+
+def test_parametric_gamma_lowers_var_for_long_gamma_and_raises_it_for_short(demo):
+    """A long straddle has positive gamma: the delta-gamma VaR is below delta-only; short is above.
+    Both straddles' delta-gamma P&L is 1/2 sigma^2 chi2(1)-shaped (skew +-2.83, excess kurtosis 12),
+    outside the Cornish-Fisher domain, so both results come from the exact quadratic form."""
+    _, mkt, hist = demo
+    long_, short = _straddles()
     for book, sign in ((long_, -1), (short, +1)):
         d = V.parametric_var(book, mkt, hist, 0.99, 1, order="delta").var
-        dg = V.parametric_var(book, mkt, hist, 0.99, 1, order="delta-gamma").var
-        assert sign * (dg - d) > 0
+        r = V.parametric_var(book, mkt, hist, 0.99, 1, order="delta-gamma")
+        assert sign * (r.var - d) > 0
+        assert "quadratic_form_simulated" in r.notes and r.n_scenarios == V.EXACT_N_DRAWS
+
+
+def test_long_gamma_parametric_var_is_a_positive_loss_bounded_by_theta_and_es_ge_var(demo):
+    """A long straddle's delta-gamma P&L is theta*h + delta$ x + 1/2 gamma$ x^2, bounded below by
+    theta*h - delta$^2 / (2 gamma$) (here -$196/day): the 99 % loss is a positive number at most that
+    floor, and ES >= VaR. The raw Cornish-Fisher polynomial for this book is non-monotone and returns
+    a NEGATIVE VaR (-260) and ES < VaR; the result must carry the note and the exact numbers instead."""
+    _, mkt, hist = demo
+    long_, _ = _straddles()
+    theta_h, b, L, S = V.parametric_moments(long_, mkt, hist, 1, "delta-gamma")
+    assert theta_h < 0 and L[0, 0] > 0
+    raw_var, raw_es, _, skew, exk = V.cornish_fisher_var_es(theta_h, b, L, S, 0.99)
+    assert not V.cornish_fisher_is_monotone(skew, exk) and raw_var < 0 and raw_es < raw_var
+    r = V.parametric_var(long_, mkt, hist, 0.99, 1, order="delta-gamma")
+    assert "cornish_fisher_nonmonotone" in r.notes
+    floor = -theta_h + b[0] ** 2 / (2 * L[0, 0])
+    assert 0 < r.var <= r.es <= floor + 1e-9
+    assert r.var == pytest.approx(floor, rel=0.01)          # the 1 % quantile of the quadratic sits at the floor
+    exact = V.quadratic_form_var_es(theta_h, b, L, S, 0.99, n=V.EXACT_N_DRAWS, seed=0)
+    assert (r.var, r.es) == exact
+
+
+def test_cornish_fisher_matches_the_exact_quadratic_form_inside_its_domain_and_defers_outside(demo):
+    """Demo book, delta-gamma-vega. h = 1 (skew -0.4, excess kurtosis 0.7): the CF quantile and tail mean
+    are within 3 % of the exact quadratic form (400k draws). h = 10 (skew -1.6, kurtosis 5.4): the raw CF
+    is 10-14 % above the exact numbers, so it is out of domain and `parametric_var` returns the
+    exact simulation with a note, identical to quantile="exact" at the same seed. h = 60 (skew -2.5,
+    kurtosis 10) defers the same way. The global Maillard test is stricter than the guard: with
+    kurtosis ~0 and skew -0.4 (most days of the rolling backtest) the cubic turns over at z ~ +4 and
+    -9, outside the loss tail, and CF is within 1 % of the exact numbers there."""
+    book, mkt, hist = demo
+    th, b, L, S = V.parametric_moments(book, mkt, hist, 1)
+    cf_var, cf_es, _, skew, exk = V.cornish_fisher_var_es(th, b, L, S, 0.99)
+    assert V.cornish_fisher_in_domain(skew, exk) and abs(skew) < 0.5 and exk < 1.0
+    ex_var, ex_es = V.quadratic_form_var_es(th, b, L, S, 0.99, n=400_000, seed=1)
+    assert cf_var == pytest.approx(ex_var, rel=0.03) and cf_es == pytest.approx(ex_es, rel=0.03)
+    r1 = V.parametric_var(book, mkt, hist, 0.99, 1)
+    assert r1.notes == () and r1.n_scenarios == 0 and (r1.var, r1.es) == (cf_var, cf_es)
+    th, b, L, S = V.parametric_moments(book, mkt, hist, 10)
+    cf_var, cf_es, _, skew, exk = V.cornish_fisher_var_es(th, b, L, S, 0.99)
+    ex_var, ex_es = V.quadratic_form_var_es(th, b, L, S, 0.99, n=400_000, seed=1)
+    assert not V.cornish_fisher_in_domain(skew, exk) and V.cornish_fisher_is_monotone(skew, exk)
+    assert 1.05 < cf_var / ex_var < 1.15 and 1.08 < cf_es / ex_es < 1.18
+    for h in (10, 60):
+        r = V.parametric_var(book, mkt, hist, 0.99, h, seed=3)
+        e = V.parametric_var(book, mkt, hist, 0.99, h, quantile="exact", seed=3)
+        assert r.notes == ("cornish_fisher_out_of_domain", "quadratic_form_simulated") and e.notes == ("quadratic_form_simulated",)
+        assert (r.var, r.es) == (e.var, e.es) and r.es >= r.var > 0
+    assert not V.cornish_fisher_is_monotone(-0.4, 0.0) and V.cornish_fisher_in_domain(-0.4, 0.0)
+    assert V.cornish_fisher_is_monotone_on(-0.4, 0.0, -6.0, norm.ppf(0.01)) and not V.cornish_fisher_is_monotone_on(-0.4, 0.0, -6.0, 6.0)
+    from riskkit.backtest import _market_at
+    from riskkit.positions import mark
+    for t in (len(hist) - 250, len(hist) - 125):    # two rolling-backtest days: the market then, the 1000 days before
+        m = _market_at(book, mkt, hist, t)
+        th, b, L, S = V.parametric_moments(book, m, hist.iloc[t - 1000:t], 1, marks=mark(book, m))
+        v, e, _, skew, exk = V.cornish_fisher_var_es(th, b, L, S, 0.99)
+        assert V.cornish_fisher_in_domain(skew, exk) and abs(skew) < 0.6 and exk < 0.5
+        ev, ee = V.quadratic_form_var_es(th, b, L, S, 0.99, n=400_000, seed=1)
+        assert v == pytest.approx(ev, rel=0.01) and e == pytest.approx(ee, rel=0.01)
+    with pytest.raises(ValueError, match="quantile"):
+        V.parametric_var(book, mkt, hist, 0.99, 1, quantile="magic")
 
 
 def test_fhs_garch_fit_recovers_known_parameters():

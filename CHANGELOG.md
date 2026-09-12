@@ -1,7 +1,18 @@
 # Changelog
 
+## 0.1.1 — 2026-09-12
+Fixes from an independent numeric and claims review; 67 tests.
+- `var.parametric_var` — the Cornish-Fisher quantile is used only inside its validity domain (monotone, |skew| ≤ 1, excess kurtosis ≤ 3); outside it, or with `quantile="exact"`, the exact quadratic form is simulated (seeded, homogeneous) and the result carries `cornish_fisher_nonmonotone` / `cornish_fisher_out_of_domain` + `quadratic_form_simulated`. A long straddle's delta-gamma VaR was −260 (a gain) with ES < VaR; it is now +196 with ES ≥ VaR. New `parametric_moments`, `cornish_fisher_var_es`, `quadratic_form_var_es`, `cornish_fisher_in_domain`
+- `pricing.revalue_factors` — scenario P&L is measured from the model price at each leg's marked inputs, so zero shock is exactly zero for every leg; a NO_IV quote mid no longer enters every scenario as a constant (it moved the demo VaR from 6,277 to 104,143)
+- `report` — under a lock the VaR table's historical row is the assessment's governing number (widened, frozen), the other methods run on the marked market, the header prints the last valid mid, and the governing number is printed by name; `RiskAssessment` gains `market`
+- `backtest` — Christoffersen CC and Engle-Manganelli DQ p-values simulated under the exact i.i.d. null by default (`n_sim=0` for χ²; asymptotic p kept in `details`); the DQ regressor matrix drops the constant-VaR column (df 5, not 6); `scenario_sampler` builds the Acerbi-Szekely null from a method's own scenario set and the report uses it for historical / Monte Carlo / FHS
+- `edge_cases` — a positive lock move reports state `LIMIT_UP` (was `LIMIT_DOWN` with a `LIMIT_UP` flag)
+- `stress` — reverse-stress bracketing on a 512-point grid (was 64) with the resolution in `ReverseStress.grid_step`; `HISTORICAL_SCENARIOS` days are calendar days (Oct-2008: 31, Mar-2020: 33)
+- `riskkit report --seed`
+- README / DESIGN — the DESIGN backtest table repaired; seed movement, ratios, the schema and pricer-interface claims, the report's table shape, and the tolerance of the CF tail-mean test stated as measured
+
 ## 0.1.0 — 2026-09-11
-- `positions` — deskboard's leg / position schema verbatim (OPT / STK / FUT, `hedge_shares`), risk-factor mapping, marks, dollar Greeks
+- `positions` — deskboard's leg / position schema (OPT / STK, `hedge_shares`) plus a FUT leg with an explicit multiplier, risk-factor mapping, marks, dollar Greeks
 - `pricing` — Black-Scholes price / Greeks / implied vol with deskboard's API; array pricing; full revaluation under (spot, vol, time) scenarios
 - `var` — historical simulation, parametric delta-gamma-vega with a Cornish-Fisher quantile and exact CF tail-mean ES, Gaussian Monte Carlo, filtered historical simulation with GARCH(1,1) via `arch`; one `VaRResult` shape
 - `backtest` — Kupiec POF, Christoffersen independence / conditional coverage, Basel traffic light, Acerbi-Szekely Z2 with simulated p-value, Engle-Manganelli DQ; exact `kupiec_size` / `kupiec_power`; rolling out-of-sample forecaster

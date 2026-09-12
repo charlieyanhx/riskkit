@@ -33,6 +33,10 @@ def test_named_scenarios_are_data_with_sources(marked):
     oct08 = next(s for s in st.HISTORICAL_SCENARIOS if s.name == "Oct-2008")
     assert math.exp(oct08.spot_move) - 1 == pytest.approx(968.75 / 1166.36 - 1, abs=1e-12)
     assert oct08.vol_move == pytest.approx(0.205, abs=1e-12)
+    # `days` are calendar days, the unit `pricing.revalue` moves T by: 30 Sep - 31 Oct 2008, 19 Feb - 23 Mar 2020
+    import datetime as dt
+    assert oct08.days == (dt.date(2008, 10, 31) - dt.date(2008, 9, 30)).days == 31
+    assert next(s for s in st.HISTORICAL_SCENARIOS if s.name == "Mar-2020").days == (dt.date(2020, 3, 23) - dt.date(2020, 2, 19)).days == 33
     df = st.historical_scenarios(ms, mkt)
     assert list(df.columns) == ["scenario", "spot_move", "vol_move", "days", "pnl", "source"] and len(df) == len(names)
 
@@ -71,6 +75,30 @@ def test_reverse_stress_reports_no_breach_when_the_book_cannot_lose_that_much():
     assert not rs.found and math.isnan(rs.shock) and math.isnan(rs.pnl)
     rs2 = st.reverse_stress_spot(ms, mkt, premium * 0.5, vol_response=lambda x: 0.0, direction="up")
     assert rs2.found and rs2.shock > 0 and rs2.pnl == pytest.approx(-premium * 0.5, abs=1e-6)
+
+
+def test_reverse_stress_grid_resolves_a_narrow_loss_region():
+    """A long 496/497/498 put fly pinned five days from expiry plus a short put: the loss region
+    below the limit is ~0.3 % of spot wide around -0.5 %. A 64-point bracket (0.78 % steps) stepped
+    over it and reported -5.8 % as the smallest shock; the default 512-point grid (0.1 % steps) finds
+    the first breach at -0.512 % (fine scan: -0.5125 %), and reports its resolution."""
+    mkt = Market(asof=__import__("pandas").Timestamp("2026-06-12T20:00", tz="UTC"), spot={"SYN": 500.0}, vol={"SYN": 0.2})
+
+    def opt(k, r, side, q, exp):
+        return {"symbol": "SYN", "sec_type": "OPT", "expiration": exp, "strike": float(k), "right": r, "side": side, "quantity": float(q)}
+
+    book = Book.from_positions([
+        {"pos_id": "fly", "legs": [opt(496, "P", "SELL", 100, "20260617"), opt(497, "P", "BUY", 200, "20260617"), opt(498, "P", "SELL", 100, "20260617")]},
+        {"pos_id": "put", "legs": [opt(445, "P", "SELL", 30, "20260717")]}])
+    ms = mark(book, mkt)
+    coarse = st.reverse_stress_spot(ms, mkt, 5000.0, vol_response=lambda x: 0.0, days=5.0, n_grid=64)
+    fine = st.reverse_stress_spot(ms, mkt, 5000.0, vol_response=lambda x: 0.0, days=5.0)
+    assert coarse.found and coarse.shock < -0.05 and coarse.grid_step == pytest.approx(0.5 / 64)
+    assert fine.found and fine.shock == pytest.approx(-0.00512, abs=5e-5) and fine.grid_step == pytest.approx(0.5 / 512)
+    assert fine.pnl == pytest.approx(-5000.0, abs=1e-6)
+    xs = np.linspace(-0.02, 0.0, 4001)
+    first = xs[np.array([st.scenario_pnl(ms, mkt, x, 0.0, 5.0) for x in xs]) <= -5000.0].max()
+    assert fine.shock == pytest.approx(first, abs=1e-5)
 
 
 def test_reverse_stress_finds_the_first_breach_not_an_arbitrary_root():

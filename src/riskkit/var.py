@@ -17,8 +17,17 @@ Parametric delta-gamma-vega (Zangari 1996 / Jorion ch. 10 with a Cornish-Fisher 
 P&L ~ theta*h + b'z + 1/2 z'Lz with z ~ N(0, h*Sigma); the cumulants of a Gaussian quadratic
 form are k1 = 1/2 tr(LS), k2 = b'Sb + 1/2 tr((LS)^2), k3 = 3 b'SLSb + tr((LS)^3),
 k4 = 12 b'SLSLSb + 3 tr((LS)^4) (S = h*Sigma). The CF quantile uses skew and excess kurtosis
-from those; ES is the exact tail mean of the CF quantile function. When the CF polynomial is
-not monotone (Maillard 2012 domain) the result carries the note "cornish_fisher_nonmonotone".
+from those; ES is the exact tail mean of the CF quantile function. The CF expansion is a
+four-cumulant approximation that is only accurate for moderate departures from normality
+(Jaschke 2002): it is used when |skew| <= CF_MAX_SKEW, excess kurtosis <= CF_MAX_EXKURT AND
+the polynomial is monotone over the loss tail VaR and ES read, [-CF_Z_MAX, z_p] (Maillard
+2012's condition restricted to that interval: with kurtosis near zero the cubic always turns
+over somewhere, but at |z| ~ 5-10 where the Gaussian weight is nil); otherwise, or with
+quantile="exact", the quantile and tail mean are taken from the exact distribution of the
+quadratic form, simulated with a fixed seed (theta*h + b'z + 1/2 z'Lz over n draws of
+z ~ N(0, S)) and the result says so in `notes`. Measured on the demo book against 400k
+draws, CF is within 2 % at h = 1 (skew -0.4, kurtosis 0.7) and 10-14 % off at h = 10
+(skew -1.6, kurtosis 5.4), which is why the domain guard exists (tests/test_var_identities.py).
 """
 
 from __future__ import annotations
@@ -43,6 +52,12 @@ class VaRResult:
     n_scenarios: int      # 0 for the parametric method
     notes: tuple[str, ...] = ()
     pnl: np.ndarray | None = field(default=None, repr=False, compare=False)  # scenario P&L, when simulated
+
+
+CF_MAX_SKEW = 1.0        # |skew| beyond which the Cornish-Fisher quantile is not trusted
+CF_MAX_EXKURT = 3.0      # excess kurtosis beyond which it is not trusted
+CF_Z_MAX = 6.0           # the CF polynomial must be monotone on [-CF_Z_MAX, z_p], the loss tail used
+EXACT_N_DRAWS = 200_000  # draws for the exact quadratic-form fallback
 
 
 # ---- scenario set -> (VaR, ES) ------------------------------------------------------------
@@ -126,13 +141,32 @@ def cornish_fisher_z(z: float, skew: float, exkurt: float) -> float:
     return z + (z**2 - 1) * skew / 6 + (z**3 - 3 * z) * exkurt / 24 - (2 * z**3 - 5 * z) * skew**2 / 36
 
 
+def _cf_coefficients(skew: float, exkurt: float) -> tuple[float, float, float]:
+    """(a, b, c) of the CF polynomial a z^3 + b z^2 + c z + d."""
+    return exkurt / 24 - skew**2 / 18, skew / 6, 1 - exkurt / 8 + 5 * skew**2 / 36
+
+
 def cornish_fisher_is_monotone(skew: float, exkurt: float) -> bool:
     """The CF polynomial a z^3 + b z^2 + c z + d is a valid quantile function iff its
     derivative 3a z^2 + 2b z + c is non-negative everywhere (Maillard 2012)."""
-    a, b, c = exkurt / 24 - skew**2 / 18, skew / 6, 1 - exkurt / 8 + 5 * skew**2 / 36
+    a, b, c = _cf_coefficients(skew, exkurt)
     if abs(a) < 1e-14:
         return abs(b) < 1e-14 and c >= 0
     return a > 0 and 4 * b**2 - 12 * a * c <= 1e-12
+
+
+def cornish_fisher_is_monotone_on(skew: float, exkurt: float, z_lo: float, z_hi: float) -> bool:
+    """Derivative 3a z^2 + 2b z + c >= 0 on [z_lo, z_hi]: checked at both ends and at the
+    vertex of the quadratic when it lies inside."""
+    a, b, c = _cf_coefficients(skew, exkurt)
+
+    def d(z: float) -> float:
+        return 3 * a * z**2 + 2 * b * z + c
+
+    pts = [z_lo, z_hi]
+    if abs(a) > 1e-14 and z_lo < -b / (3 * a) < z_hi:
+        pts.append(-b / (3 * a))
+    return min(d(z) for z in pts) >= -1e-12
 
 
 def cornish_fisher_tail_mean(p: float, skew: float, exkurt: float) -> float:
@@ -164,21 +198,55 @@ def factor_cov(history: pd.DataFrame, cols: list[str]) -> np.ndarray:
     return np.atleast_2d(np.cov(history[cols].to_numpy(dtype=float), rowvar=False, ddof=1))
 
 
-def parametric_var(book: Book, market: Market, history: pd.DataFrame, confidence: float = 0.99,
-                   horizon_days: int = 1, order: str = "delta-gamma-vega",
-                   marks: list[LegMark] | None = None) -> VaRResult:
-    """`order` in {"delta", "delta-gamma", "delta-gamma-vega"}. Delta and gamma are in the
-    spot log-return x (delta$ = Delta*S*q*mult, gamma$ = Gamma*S^2*q*mult); vega$ per 1.00
-    vol; theta$*h enters the mean. With order="delta" the result is the Gaussian closed form
-    VaR = z_c * sqrt(h * b'Sigma b) - theta*h exactly (k3 = k4 = 0)."""
+def cornish_fisher_in_domain(skew: float, exkurt: float, confidence: float = 0.99) -> bool:
+    """CF is used only where it is a valid quantile function over the loss tail it is read on
+    ([-CF_Z_MAX, z_p], p = 1 - confidence) and the cumulants are moderate."""
+    z_p = float(norm.ppf(1.0 - confidence))
+    return (abs(skew) <= CF_MAX_SKEW and exkurt <= CF_MAX_EXKURT
+            and cornish_fisher_is_monotone_on(skew, exkurt, -CF_Z_MAX, max(z_p, -CF_Z_MAX)))
+
+
+def cornish_fisher_var_es(theta_h: float, b: np.ndarray, L: np.ndarray, S: np.ndarray, confidence: float
+                          ) -> tuple[float, float, float, float, float]:
+    """(VaR, ES, sd, skew, excess kurtosis) of theta_h + b'z + 1/2 z'Lz, z ~ N(0, S), by the CF
+    quantile and its exact tail mean; sd = 0 gives (-mu, -mu, 0, 0, 0)."""
+    k1, k2, k3, k4 = quadratic_form_cumulants(b, L, S)
+    mu, sd = theta_h + k1, float(np.sqrt(max(k2, 0.0)))
+    if sd == 0.0:
+        return -mu, -mu, 0.0, 0.0, 0.0
+    skew, exk = k3 / sd**3, k4 / sd**4
+    p = 1.0 - confidence
+    var = -(mu + sd * cornish_fisher_z(norm.ppf(p), skew, exk))
+    es = -(mu + sd * cornish_fisher_tail_mean(p, skew, exk))
+    return float(var), float(es), sd, float(skew), float(exk)
+
+
+def quadratic_form_var_es(theta_h: float, b: np.ndarray, L: np.ndarray, S: np.ndarray, confidence: float,
+                          n: int = EXACT_N_DRAWS, seed: int = 0) -> tuple[float, float]:
+    """(VaR, ES) of theta_h + b'z + 1/2 z'Lz, z ~ N(0, S), from `n` seeded draws: the exact
+    distribution of the delta-gamma(-vega) P&L up to simulation error, and homogeneous in the
+    book because the draws are fixed by the seed."""
+    nf = len(b)
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n, nf)) @ np.linalg.cholesky(S + 1e-18 * np.eye(nf)).T
+    pnl = theta_h + z @ b + 0.5 * np.einsum("ij,ij->i", z @ L, z)
+    return var_es_from_pnl(pnl, confidence)
+
+
+def parametric_moments(book: Book, market: Market, history: pd.DataFrame, horizon_days: int = 1,
+                       order: str = "delta-gamma-vega", marks: list[LegMark] | None = None
+                       ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """(theta$*h, b, L, S) of the Greek expansion P&L ~ theta*h + b'z + 1/2 z'Lz, z ~ N(0, S):
+    b = delta$ (and vega$ for order "delta-gamma-vega"), L = diag(gamma$) unless order "delta",
+    S = h * sample covariance of the factors used. Empty book -> zero-length arrays."""
     if order not in ("delta", "delta-gamma", "delta-gamma-vega"):
         raise ValueError(f"unknown order {order!r}")
     spot_cols, vol_cols = factor_names(book)
     ms = _marks(book, market, marks)
-    if not ms:
-        return VaRResult("parametric-" + order, confidence, horizon_days, 0.0, 0.0, 0, ("EMPTY",))
     us = book.underlyings()
     cols = spot_cols + (vol_cols if order == "delta-gamma-vega" else [])
+    if not ms:
+        return 0.0, np.zeros(0), np.zeros((0, 0)), np.zeros((0, 0))
     S = horizon_days * factor_cov(history, cols)
     g = dollar_greeks(ms, market)
     nf = len(cols)
@@ -191,18 +259,43 @@ def parametric_var(book: Book, market: Market, history: pd.DataFrame, confidence
         if order == "delta-gamma-vega":
             b[len(us) + i] = g[u]["vega"]
         theta += g[u]["theta"]
-    k1, k2, k3, k4 = quadratic_form_cumulants(b, L, S)
-    mu, sd = theta * horizon_days + k1, np.sqrt(max(k2, 0.0))
-    notes: tuple[str, ...] = ()
+    return theta * horizon_days, b, L, S
+
+
+def parametric_var(book: Book, market: Market, history: pd.DataFrame, confidence: float = 0.99,
+                   horizon_days: int = 1, order: str = "delta-gamma-vega",
+                   marks: list[LegMark] | None = None, quantile: str = "cornish-fisher",
+                   n_draws: int = EXACT_N_DRAWS, seed: int = 0) -> VaRResult:
+    """`order` in {"delta", "delta-gamma", "delta-gamma-vega"}. Delta and gamma are in the
+    spot log-return x (delta$ = Delta*S*q*mult, gamma$ = Gamma*S^2*q*mult); vega$ per 1.00
+    vol; theta$*h enters the mean. With order="delta" the result is the Gaussian closed form
+    VaR = z_c * sqrt(h * b'Sigma b) - theta*h exactly (k3 = k4 = 0).
+
+    `quantile`: "cornish-fisher" uses the CF quantile inside its validity domain
+    (`cornish_fisher_in_domain`) and the exact simulated quadratic form outside it, with the
+    notes "cornish_fisher_nonmonotone" (not monotone on the loss tail) and / or
+    "cornish_fisher_out_of_domain" (cumulants too large), plus "quadratic_form_simulated";
+    "exact" always simulates (`n_draws`, `seed`)."""
+    if quantile not in ("cornish-fisher", "exact"):
+        raise ValueError(f"unknown quantile {quantile!r}")
+    name = "parametric-" + order
+    theta_h, b, L, S = parametric_moments(book, market, history, horizon_days, order, marks)
+    if len(b) == 0:
+        return VaRResult(name, confidence, horizon_days, 0.0, 0.0, 0, ("EMPTY",))
+    var, es, sd, skew, exk = cornish_fisher_var_es(theta_h, b, L, S, confidence)
     if sd == 0.0:
-        return VaRResult("parametric-" + order, confidence, horizon_days, max(-mu, 0.0), max(-mu, 0.0), 0, ("ZERO_VARIANCE",))
-    skew, exk = k3 / sd**3, k4 / sd**4
-    if not cornish_fisher_is_monotone(skew, exk):
-        notes = ("cornish_fisher_nonmonotone",)
-    p = 1.0 - confidence
-    var = -(mu + sd * cornish_fisher_z(norm.ppf(p), skew, exk))
-    es = -(mu + sd * cornish_fisher_tail_mean(p, skew, exk))
-    return VaRResult("parametric-" + order, confidence, horizon_days, float(var), float(es), 0, notes)
+        return VaRResult(name, confidence, horizon_days, max(var, 0.0), max(es, 0.0), 0, ("ZERO_VARIANCE",))
+    notes: tuple[str, ...] = ()
+    if quantile == "cornish-fisher" and cornish_fisher_in_domain(skew, exk, confidence):
+        return VaRResult(name, confidence, horizon_days, var, es, 0, notes)
+    if quantile == "cornish-fisher":
+        z_p = max(float(norm.ppf(1.0 - confidence)), -CF_Z_MAX)
+        if not cornish_fisher_is_monotone_on(skew, exk, -CF_Z_MAX, z_p):
+            notes += ("cornish_fisher_nonmonotone",)
+        if abs(skew) > CF_MAX_SKEW or exk > CF_MAX_EXKURT:
+            notes += ("cornish_fisher_out_of_domain",)
+    var, es = quadratic_form_var_es(theta_h, b, L, S, confidence, n_draws, seed)
+    return VaRResult(name, confidence, horizon_days, var, es, n_draws, notes + ("quadratic_form_simulated",))
 
 
 # ---- Monte Carlo from a fitted covariance ------------------------------------------------
@@ -304,5 +397,5 @@ def all_methods(book: Book, market: Market, history: pd.DataFrame, confidence: f
     ms = _marks(book, market, marks)
     fhs, _ = fhs_var(book, market, history, confidence, horizon_days, n_scenarios, seed, ms)
     return [historical_var(book, market, history, confidence, horizon_days, ms),
-            parametric_var(book, market, history, confidence, horizon_days, "delta-gamma-vega", ms),
+            parametric_var(book, market, history, confidence, horizon_days, "delta-gamma-vega", ms, seed=seed),
             monte_carlo_var(book, market, history, confidence, horizon_days, n_scenarios, seed, ms), fhs]

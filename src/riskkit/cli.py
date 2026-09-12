@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--n-test", type=int, default=250, help="out-of-sample days for the backtest")
     r.add_argument("--window", type=int, default=1000, help="estimation window (days) for each forecast")
     r.add_argument("--limit", type=float, default=25_000.0, help="loss limit for reverse stress, $")
+    r.add_argument("--seed", type=int, default=0, help="seed for the Monte Carlo / FHS draws and the simulated p-values")
     r.add_argument("--no-backtest", action="store_true")
     a = ap.parse_args(argv)
 
@@ -37,7 +38,7 @@ def main(argv: list[str] | None = None) -> None:
 
         book, market, history = load_demo(a.data)
         rep = build(book, market, history, a.confidence, a.horizon, a.scenarios, a.n_test, a.window, a.limit,
-                    run_backtest=not a.no_backtest)
+                    seed=a.seed, run_backtest=not a.no_backtest)
         print(render(rep))
 
 

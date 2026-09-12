@@ -10,8 +10,8 @@ SYN = "SYN"
 
 
 def test_canonical_atm_case_call_and_put():
-    """S=K=100, r=5%, sigma=20%, T=1: call 10.4505835722, put 5.5735260223 — closed form recomputed
-    with scipy and QuantLib 1.43 AnalyticEuropeanEngine (_plan4_inputs/oracle_values.json), tol 1e-8."""
+    """S=K=100, r=5%, sigma=20%, T=1: call 10.4505835722, put 5.5735260223 — the closed form via
+    scipy.stats.norm, cross-checked against QuantLib 1.43 AnalyticEuropeanEngine, tol 1e-8."""
     assert bs.price(100, 100, 1.0, 0.2, "C", r=0.05) == pytest.approx(10.4505835722, abs=1e-8)
     assert bs.price(100, 100, 1.0, 0.2, "P", r=0.05) == pytest.approx(5.5735260223, abs=1e-8)
 
@@ -66,6 +66,20 @@ def test_revalue_zero_shock_is_zero_and_matches_scalar_repricing():
             v1 = m.spot * math.exp(x)
         expected += (v1 - m.value) * m.sq * m.mult
     assert bs.revalue(ms, x, y, d)[0] == pytest.approx(expected, abs=1e-9)
+
+
+def test_revalue_zero_shock_is_zero_for_a_leg_marked_at_a_quote_mid():
+    """A leg marked at a quote mid (with an inverted implied vol, or with none and the fallback vol)
+    revalues to exactly zero P&L at zero shock: the scenario P&L is measured from the model price at
+    the marked inputs, not from the mid."""
+    book, mkt, _ = _marks()
+    key = "SYN:20260801:480:P"
+    for quote in ((7.25, 0.21), (7.25, float("nan"))):
+        ms = mark(book, mkt, quotes={key: quote})
+        m = next(x for x in ms if x.key == key)
+        assert m.value == 7.25 and abs(bs.price(m.spot, m.strike, m.T, m.iv, m.right) - 7.25) > 1e-3
+        assert bs.revalue([m], 0.0, 0.0, 0.0)[0] == 0.0 and bs.revalue(ms, 0.0, 0.0, 0.0)[0] == 0.0
+        assert bs.revalue([m], np.zeros(3), np.zeros(3)).tolist() == [0.0, 0.0, 0.0]
 
 
 def test_revalue_broadcasts_over_scenarios():

@@ -66,10 +66,54 @@ def test_report_prints_flags_under_a_lock():
     assert "\nstate: LIMIT_DOWN\n" in text and "LIMIT_DOWN [SYN]" in text and "lock move continuing" in text
 
 
+def test_report_under_a_lock_prints_the_governing_number_and_the_marked_spot():
+    """The limit-down fixture of test_edge_cases: the raw 340-day window says VaR fell. The report's
+    historical row must be the assessment's number (widened set, frozen at the last unlocked value if
+    lower), so it is >= the last unlocked VaR / ES and above the raw recomputation; the header prints
+    the last valid mid (500), not the locked print (465); the other methods run on the marked market;
+    the governing number is printed by name."""
+    import math
+
+    from riskkit.edge_cases import Lock, assess
+    from riskkit.positions import Market
+    from riskkit.var import historical_var
+    book, mkt, hist = load_demo(DATA)
+    unlocked = assess(book, mkt, hist)
+    window = pd.concat([hist.iloc[-300:], pd.DataFrame({"date": ["lock"] * 40, "SYN:spot": 0.0, "SYN:vol": 0.0})], ignore_index=True)
+    raw = historical_var(book, mkt, window, 0.99, 1)
+    assert raw.var < unlocked.var.var
+    lock = Lock("SYN", mkt.spot["SYN"], math.log(0.93), mkt.asof - pd.Timedelta(minutes=30))
+    locked_print = Market(mkt.asof, {"SYN": mkt.spot["SYN"] * 0.93}, mkt.vol)
+    rep = rp.build(book, locked_print, window, run_backtest=False, n_scenarios=500, lock=lock, previous=unlocked.var)
+    text = rp.render(rep)
+    hist_row = next(r for r in rep.results if r.method == "historical")
+    assert hist_row == rep.assessment.var and hist_row.var >= unlocked.var.var and hist_row.es >= unlocked.var.es
+    assert hist_row.var > raw.var and hist_row.n_scenarios == len(window) + 3
+    assert rep.market.spot["SYN"] == 500.0 and "SYN spot 500.00" in text and "465.00" not in text
+    assert f"| historical | {hist_row.var:,.0f} | {hist_row.es:,.0f} | {hist_row.n_scenarios} |" in text
+    assert f"Governing number (state LIMIT_DOWN): historical VaR {hist_row.var:,.0f} / ES {hist_row.es:,.0f}" in text
+    assert all(m.spot == 500.0 for m in rep.assessment.marks)
+    ok = rp.render(rp.build(book, mkt, hist, run_backtest=False, n_scenarios=500))
+    assert "Governing number (state OK): historical VaR 6,277 / ES 9,002." in ok
+
+
 def test_cli_report_runs(capsys):
     main(["report", "--data", str(DATA), "--scenarios", "500", "--n-test", "10", "--window", "300"])
     out = capsys.readouterr().out
     assert "state: OK" in out and "## Backtest, last 10 days" in out
+
+
+def test_cli_report_seed_moves_only_the_simulated_lines(capsys):
+    """`--seed` changes the Monte Carlo and FHS rows (and the simulated p-values); the historical and
+    parametric rows are identical across seeds."""
+    rows = {}
+    for seed in ("0", "1"):
+        main(["report", "--data", str(DATA), "--scenarios", "500", "--no-backtest", "--seed", seed])
+        out = capsys.readouterr().out
+        rows[seed] = {line.split("|")[1].strip(): line for line in out.splitlines() if line.startswith("| ")}
+    for m in ("historical", "parametric-delta-gamma-vega"):
+        assert rows["0"][m] == rows["1"][m]
+    assert rows["0"]["monte-carlo"] != rows["1"]["monte-carlo"] and rows["0"]["fhs-garch"] != rows["1"]["fhs-garch"]
 
 
 def test_cli_entry_point_help():

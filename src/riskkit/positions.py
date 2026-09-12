@@ -1,6 +1,8 @@
 """Book schema, risk-factor mapping and marking.
 
-The leg / position shape is deskboard's (`engine/book.py`, `feeds/blotter.py`), verbatim:
+The leg / position shape is deskboard's (`engine/book.py`, `feeds/blotter.py`) — OPT / STK
+legs and `hedge_shares` load unchanged — plus a FUT leg with an explicit per-contract
+multiplier, which deskboard does not have:
 
     leg      = {symbol, sec_type "OPT"|"STK"|"FUT", expiration "YYYYMMDD", strike, right "C"|"P",
                 side "BUY"|"SELL", quantity, multiplier?}
@@ -22,7 +24,9 @@ which case the mid is the value and its implied vol is inverted (deskboard's con
 STK and FUT legs at the spot factor level. Units: per-share value; dollar exposure is
 value x signed quantity x multiplier. Invariant kept here: `book_value(marks)` equals the
 sum of leg values times signed quantity times multiplier, and `revalue` at zero shock is
-exactly zero P&L.
+exactly zero P&L for every leg — scenario P&L is measured from the model price at the leg's
+marked (spot, iv, T), so a quote mid with no implied vol (NO_IV) changes the book value
+but not the risk numbers.
 """
 
 from __future__ import annotations
