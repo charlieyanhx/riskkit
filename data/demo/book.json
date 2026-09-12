@@ -1,0 +1,80 @@
+[
+ {
+  "pos_id": "A-0601",
+  "sleeve": "A",
+  "legs": [
+   {
+    "symbol": "SYN",
+    "sec_type": "OPT",
+    "expiration": "20260727",
+    "strike": 480.0,
+    "right": "P",
+    "side": "SELL",
+    "quantity": 10.0
+   },
+   {
+    "symbol": "SYN",
+    "sec_type": "OPT",
+    "expiration": "20260727",
+    "strike": 440.0,
+    "right": "P",
+    "side": "BUY",
+    "quantity": 10.0
+   }
+  ]
+ },
+ {
+  "pos_id": "C-0603",
+  "sleeve": "C",
+  "legs": [
+   {
+    "symbol": "SYN",
+    "sec_type": "OPT",
+    "expiration": "20260712",
+    "strike": 470.0,
+    "right": "P",
+    "side": "SELL",
+    "quantity": 6.0
+   },
+   {
+    "symbol": "SYN",
+    "sec_type": "OPT",
+    "expiration": "20260712",
+    "strike": 530.0,
+    "right": "C",
+    "side": "SELL",
+    "quantity": 6.0
+   }
+  ],
+  "hedge_shares": -30
+ },
+ {
+  "pos_id": "S-0610",
+  "sleeve": "S",
+  "legs": [
+   {
+    "symbol": "SYN",
+    "sec_type": "OPT",
+    "expiration": "20260811",
+    "strike": 490.0,
+    "right": "P",
+    "side": "BUY",
+    "quantity": 2.0
+   }
+  ]
+ },
+ {
+  "pos_id": "F-0611",
+  "sleeve": "F",
+  "legs": [
+   {
+    "symbol": "SYN",
+    "sec_type": "FUT",
+    "expiration": "20260910",
+    "side": "SELL",
+    "quantity": 1.0,
+    "multiplier": 50.0
+   }
+  ]
+ }
+]
