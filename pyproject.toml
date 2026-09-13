@@ -1,6 +1,6 @@
 [project]
 name = "riskkit"
-version = "0.1.1"
+version = "0.3.0"
 description = "Portfolio risk for a futures-and-options book: VaR/ES by four methods with full revaluation, a backtest suite with known size and power, stress and reverse stress, and explicit limit-down / empty-book / stale-quote semantics."
 readme = "README.md"
 requires-python = ">=3.11"

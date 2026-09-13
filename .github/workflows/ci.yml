@@ -23,3 +23,6 @@ jobs:
           git diff --exit-code -- data/demo
           riskkit report > /tmp/report.md
           grep -q "^state: " /tmp/report.md
+          riskkit span-fixture --out /tmp/span_synthetic.pa2
+          cmp /tmp/span_synthetic.pa2 tests/fixtures/span_synthetic.pa2
+          riskkit span --file tests/fixtures/span_synthetic.pa2 --commodity ZZ > /dev/null

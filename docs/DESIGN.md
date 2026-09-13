@@ -210,3 +210,45 @@ limit-down scenarios sit in its loss tail.
   against GC files, and a SPAN 2 approximation clearly labelled as such — not before.
 - **v0.4** — live marks from the deskboard bus and a `pricers` surface pricer as a drop-in
   (the pricing API is deskboard's `price`, `greeks`, `implied_vol` plus `price_vec`).
+
+## SPAN (v0.3)
+
+**Files.** `span_files.py` reads CME's expanded-unpacked `.pa2` (or its `.zip`) as a stream
+and keeps one combined commodity: Type 0 header; P (product, decimal locators, contract
+value factor); 2 (combined-commodity membership); S (scanning method); 3 (intra tiers);
+E / C (series and tier intra-commodity spreads with priority and charge rate); 4 (delivery
+method and short-option minimum); B (scan range, vol scan, extreme multiplier and cover,
+delta scaling); 81/82 (the 16-value risk array, composite delta, implied vol, settlement,
+current delta); 6 (inter-commodity spreads, parsed and counted, not applied). Column
+offsets live in one `LAYOUT` table. Facts pinned on the real file: values are a 5-digit
+magnitude followed by the sign (`05333-`), loss-positive for a long; the 81 line carries
+scenarios 1–9 from column 55, the 82 line 10–16 then composite delta (4 decimals),
+implied vol (6 decimals), settlement (locator from the P record); the GC September 2025
+array is (0, 0, −5333, −5333, 5333, 5333, −10667, −10667, 10667, 10667, −16000, −16000,
+16000, 16000, −15840, 15840) and the OG 3700 December put has delta −0.4752, vol 15.26 %,
+settlement 107.40.
+
+**Engine.** CME's 2019 methodology deck: scenarios (price {0, ±⅓, ±⅔, ±1} × vol {up, down}
+= 1–14; ±3× scan at 33 % cover = 15–16); scan risk = max over scenarios of Σ quantity ×
+array value; composite delta = weighted average over the seven price points (0.27,
+0.217 × 2, 0.11 × 2, 0.037 × 2 — read from the file, not recomputed); intra-commodity
+charge by delta consumption, series spreads (Type E) before tier spreads (Type C), each
+in priority order; SOM = short options × rate, a floor; requirement = max(scan + intra +
+delivery − inter, SOM); total = requirement − net option value (long value − short value,
+premium-style options). `compute()` returns every component and the notes for what was
+set to zero and why.
+
+**Reconciliation.** `riskkit span` prints scan risk for long 1 / short 1 per contract
+month against `data/span/published_2025-09-12.csv` (GC 16,000 / 16,000; ES 20,936 /
+20,051 — SPAN 2; CL — SPAN 2, value not transcribed) with the absolute and percentage
+error as the result. GC is exact. ES and CL are SPAN 2 products whose parameter files are
+on the clearing-firm SFTP, not public; `span2_target()` returns the published number and
+the model label so a report never presents a legacy array as their margin.
+
+**Fixture policy.** CME's file is not redistributed. `span_synth` writes a synthetic file in
+the identical layout (generator and parser written from the same layout pages
+independently, so a round-trip proves the column) and the private GC slice is gitignored,
+its tests skipped when absent; `docs/validation-private.md` records the real run.
+
+**Not implemented.** Inter-commodity spread credits and the table-driven delivery charge
+(both parsed, both zero with a note); combination products; SPAN 2.

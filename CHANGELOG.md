@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0 — 2026-09-12
+- `span_files`: streaming parser for CME expanded-unpacked `.pa2` files (Type 0/P/2/S/3/E/C/4/B/81/82/6), offsets pinned on the real 2025-09-12 file; `extract_slice`; synthetic fixture generator `span_synth`.
+- `span`: legacy SPAN engine (scan risk, composite delta, series and tier spread charges, SOM, NOV, every component reported); published-margin data with sources; reconciliation CLI `riskkit span` — GC exact (16,000 = 16,000 every month), ES/CL labelled SPAN 2.
+- fix: implied vol in the 82 record has 6 implied decimals (was read with 8).
+
 ## 0.1.1 — 2026-09-12
 Fixes from an independent numeric and claims review; 67 tests.
 - `var.parametric_var` — the Cornish-Fisher quantile is used only inside its validity domain (monotone, |skew| ≤ 1, excess kurtosis ≤ 3); outside it, or with `quantile="exact"`, the exact quadratic form is simulated (seeded, homogeneous) and the result carries `cornish_fisher_nonmonotone` / `cornish_fisher_out_of_domain` + `quadratic_form_simulated`. A long straddle's delta-gamma VaR was −260 (a gain) with ES < VaR; it is now +196 with ES ≥ VaR. New `parametric_moments`, `cornish_fisher_var_es`, `quadratic_form_var_es`, `cornish_fisher_in_domain`
