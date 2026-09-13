@@ -1,5 +1,8 @@
-"""SPAN engine on the synthetic fixture (always runs): scan-risk identities, spread charges, SOM, NOV signs."""
+"""SPAN engine on the synthetic fixture (always runs): scan-risk identities, spread charges, SOM, NOV signs,
+day-coded positions, and the refusal to price a contract the file carries no settlement for."""
 
+import dataclasses
+import math
 from pathlib import Path
 
 import pytest
@@ -82,3 +85,42 @@ def test_published_table_and_span2_target():
     es = sp.span2_target("ES")
     assert es.margin_model == "SPAN 2" and es.long_margin == 20936 and es.short_margin == 20051
     assert {p.product for p in pub} >= {"GC", "ES", "CL"}
+
+
+def test_active_scenario_is_labelled(data):
+    m = _m(data)[0]
+    long = sp.compute(data, [sp.Position(FUT, "FUT", m, 1)])
+    short = sp.compute(data, [sp.Position(FUT, "FUT", m, -1)])
+    assert (long.active_scenario, long.active_scenario_label) == (13, "down 3/3 / vol up")
+    assert (short.active_scenario, short.active_scenario_label) == (11, "up 3/3 / vol up")
+    assert len(sp.SCENARIO_LABELS) == 16 and sp.SCENARIO_LABELS[14:] == ("up extreme x cover", "down extreme x cover")
+
+
+def test_day_coded_positions_price_their_own_contract(data):
+    """The two weekly 3700 Nov calls (option day 12 / 19) and the monthly one are three positions, each valued at
+    its own settlement x contract value factor; a day-less position never silently takes a weekly's array."""
+    kw = dict(right="C", strike=3700.0, option_month=202511)
+    monthly = sp.compute(data, [sp.Position(OPT, "OOF", 202512, 1, **kw)])
+    w12 = sp.compute(data, [sp.Position(OPT, "OOF", 202512, 1, option_day="12", **kw)])
+    w19 = sp.compute(data, [sp.Position(OPT, "OOF", 202512, -2, option_day="19", **kw)])
+    assert (monthly.long_option_value, w12.long_option_value, w19.short_option_value) == (6000.0, 4100.0, 10500.0)
+    assert monthly.scan_risk != w12.scan_risk
+    with pytest.raises(KeyError, match="no risk array"):
+        sp.compute(data, [sp.Position(OPT, "OOF", 202512, 1, option_day="26", **kw)])
+
+
+def test_option_without_a_settlement_price_is_left_out_of_nov_and_named(data):
+    """A contract whose settlement field is CME's all-nines sentinel (settlement NaN) contributes its risk array
+    to the scan but nothing to the option value, and the result says which position was left out."""
+    put = data.find(OPT, "OOF", 202512, "P", 3600.0)
+    ghost = dataclasses.replace(put, strike=3500.0, settlement_price=math.nan, hp_settlement_price=math.nan)
+    d = dataclasses.replace(data, arrays=data.arrays + [ghost])
+    pos = [sp.Position(OPT, "OOF", 202512, 1, "P", 3500.0), sp.Position(OPT, "OOF", 202512, -1, "P", 3600.0)]
+    r = sp.compute(d, pos)
+    assert r.long_option_value == 0.0 and r.short_option_value == put.settlement_price * 100.0
+    assert r.total_requirement == r.span_requirement + r.short_option_value
+    assert r.scenario_losses == tuple(a - b for a, b in zip(ghost.values, put.values, strict=True))
+    assert any("no settlement price" in n and "+1 x OZ OOF 202512 202512 P 3500" in n for n in r.notes)
+    lov, sov, unpriced = sp.option_values(d, pos)
+    assert (lov, unpriced) == (0.0, ("+1 x OZ OOF 202512 202512 P 3500",))
+    assert not any("no settlement price" in n for n in sp.compute(data, pos[1:]).notes)

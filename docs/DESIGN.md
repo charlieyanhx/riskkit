@@ -203,13 +203,13 @@ limit-down scenarios sit in its loss tail.
   vanna / volga cross terms in the parametric quadratic form (the cumulant machinery takes
   them as off-diagonal entries of L; they close most of the 24 % parametric-vs-Monte Carlo
   gap on the demo book), a simulated-null p-value for the independence test.
-- **v0.3 — SPAN margin replication.** Research on public exchange files established that
-  only legacy-SPAN products such as GC reconcile exactly with the published parameter files;
-  ES and CL are SPAN 2 products whose parameter files are not public, so an exact
-  replication cannot be validated for them. v0.3 therefore ships a legacy-SPAN engine tested
-  against GC files, and a SPAN 2 approximation clearly labelled as such — not before.
-- **v0.4** — live marks from the deskboard bus and a `pricers` surface pricer as a drop-in
-  (the pricing API is deskboard's `price`, `greeks`, `implied_vol` plus `price_vec`).
+- **v0.4** — inter-commodity spread credits and the table-driven delivery charge in the
+  SPAN engine (both parsed today, both zero with a note); live marks from the deskboard bus;
+  a `pricers` surface pricer as a drop-in (the pricing API is deskboard's `price`, `greeks`,
+  `implied_vol` plus `price_vec`).
+
+The SPAN engine shipped in v0.3 (next section). SPAN 2 products get no approximation:
+`span2_target()` returns the published margin and the model label, nothing else.
 
 ## SPAN (v0.3)
 
@@ -225,8 +225,27 @@ magnitude followed by the sign (`05333-`), loss-positive for a long; the 81 line
 scenarios 1–9 from column 55, the 82 line 10–16 then composite delta (4 decimals),
 implied vol (6 decimals), settlement (locator from the P record); the GC September 2025
 array is (0, 0, −5333, −5333, 5333, 5333, −10667, −10667, 10667, 10667, −16000, −16000,
-16000, 16000, −15840, 15840) and the OG 3700 December put has delta −0.4752, vol 15.26 %,
-settlement 107.40.
+16000, 16000, −15840, 15840) and the OG 3700 December put has delta −0.4752, vol 0.152551,
+settlement 107.40 (each an exact equality in `test_span_private.py`).
+
+Four things the layout page does not say, found by an independent re-read of the whole
+2025-09-12 file and each now a test on hand-typed lines: (1) a settlement field of all
+nines (`9999999`, with the same in the 81 high-precision field) means *no price* —
+`settlement_price` is NaN and `option_values` leaves the contract out of the net option
+value with a note, instead of pricing it at 9,999.999 × the contract value factor; (2) when
+the 81 high-precision flag (col 123) is `Y` the regular field is zero and the price is read
+from the 14-digit field at cols 109–122, otherwise the two fields agree; (3) the P record's
+alignment codes (cols 40–41) are `C` = points and 32nds (CBT Treasury futures), `K` =
+points and 64ths (their options), `0` = decimal with an eighths last digit (CBT grains),
+the final digit in every case a truncated eighth (0 1 2 3 5 6 7 8 for 0/8 … 7/8) —
+established by put-call parity on the ZB Nov-25, ZN Oct-25 and corn Mar-26 chains, exact
+under the decode and off by up to half a point in decimal; Treasury option strikes carry
+the same eighths digit with a blank strike code (ZN 112.25 is `1122`), grain strikes are
+whole cents; an unknown code or a sub-tick digit of 4 or 9 raises rather than misprices;
+(4) the identity of a contract includes the futures and option day/week codes — 604,160
+arrays are distinct on it and 39,888 collide without the codes — so `RiskArray.key`,
+`SpanData.find` and `Position` carry them and a duplicate identity fails the load rather
+than overwriting.
 
 **Engine.** CME's 2019 methodology deck: scenarios (price {0, ±⅓, ±⅔, ±1} × vol {up, down}
 = 1–14; ±3× scan at 33 % cover = 15–16); scan risk = max over scenarios of Σ quantity ×
@@ -235,8 +254,9 @@ array value; composite delta = weighted average over the seven price points (0.2
 charge by delta consumption, series spreads (Type E) before tier spreads (Type C), each
 in priority order; SOM = short options × rate, a floor; requirement = max(scan + intra +
 delivery − inter, SOM); total = requirement − net option value (long value − short value,
-premium-style options). `compute()` returns every component and the notes for what was
-set to zero and why.
+premium-style options). `compute()` returns every component, the active scenario's
+label, and the notes for what was set to zero or left out and why (an option with no
+settlement price in the file is named there, not priced).
 
 **Reconciliation.** `riskkit span` prints scan risk for long 1 / short 1 per contract
 month against `data/span/published_2025-09-12.csv` (GC 16,000 / 16,000; ES 20,936 /
@@ -247,8 +267,11 @@ the model label so a report never presents a legacy array as their margin.
 
 **Fixture policy.** CME's file is not redistributed. `span_synth` writes a synthetic file in
 the identical layout (generator and parser written from the same layout pages
-independently, so a round-trip proves the column) and the private GC slice is gitignored,
-its tests skipped when absent; `docs/validation-private.md` records the real run.
+independently, so a round-trip proves the column; it carries two day-coded weeklies so the
+identity rule is exercised through the loader), the no-settlement sentinel, the
+high-precision flag and the alignment codes are tested on hand-typed lines in the same
+layout with fictional product codes, and the private GC slice is gitignored, its seven
+tests skipped when absent; `docs/validation-private.md` (gitignored) records the real run.
 
 **Not implemented.** Inter-commodity spread credits and the table-driven delivery charge
 (both parsed, both zero with a note); combination products; SPAN 2.

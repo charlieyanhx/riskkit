@@ -25,6 +25,9 @@ scaling factor of the contract's Type B record (1.0 when absent). The short opti
 option contracts per the Type 4 method (blank/"2": short calls + short puts; "1": the greater of the two)
 times the SOM charge rate. Extreme scenarios 15/16 are the file's own values (CME: 3 x the price scan
 range, 33 % covered), used as-is. Every dollar figure is scaled by 10**risk_exponent of the Type 2 record.
+An option whose settlement price the file does not carry (`RiskArray.settlement_price` NaN — CME's all-nines
+field) is left out of the net option value and named in the result's notes; it is never priced at zero or
+at the sentinel.
 
 Not implemented (see docs/DESIGN.md): inter-commodity spread credits, the table-driven delivery charge,
 intercommodity/scanning tiers other than "01", combination products, and SPAN 2 — whose parameter files are
@@ -41,8 +44,7 @@ import pandas as pd
 
 from .span_files import PRODUCT_TYPES_OPTION, RiskArray, SpanData, load_commodity
 
-COMPOSITE_DELTA_WEIGHTS = (0.27, 0.217, 0.217, 0.11, 0.11, 0.037, 0.037)   # scenarios 1, 3, 5, 7, 9, 11, 13 (deck slide 11)
-SCENARIO_LABELS = (
+SCENARIO_LABELS = (   # 1-16, the order of the risk array (CME Type 8 page)
     "unch / vol up", "unch / vol down", "up 1/3 / vol up", "up 1/3 / vol down", "down 1/3 / vol up", "down 1/3 / vol down",
     "up 2/3 / vol up", "up 2/3 / vol down", "down 2/3 / vol up", "down 2/3 / vol down", "up 3/3 / vol up", "up 3/3 / vol down",
     "down 3/3 / vol up", "down 3/3 / vol down", "up extreme x cover", "down extreme x cover",
@@ -62,6 +64,8 @@ class Position:
     right: str = ""             # "C" / "P" for options
     strike: float = 0.0
     option_month: int | None = None   # defaults to contract_month for options
+    contract_day: str = ""      # futures day/week code, "" for a monthly contract
+    option_day: str = ""        # option day/week code (dailies, weeklies, flex), "" for a monthly option
 
 
 @dataclass(frozen=True)
@@ -96,9 +100,22 @@ class SpanResult:
     currency: str
     notes: tuple[str, ...] = field(default_factory=tuple)
 
+    @property
+    def active_scenario_label(self) -> str:
+        return SCENARIO_LABELS[self.active_scenario - 1]
+
 
 def _resolve(data: SpanData, p: Position) -> RiskArray:
-    return data.find(p.commodity, p.product_type, p.contract_month, p.right, p.strike, p.option_month)
+    return data.find(p.commodity, p.product_type, p.contract_month, p.right, p.strike, p.option_month, p.contract_day, p.option_day)
+
+
+def _describe(p: Position) -> str:
+    day = f"/{p.contract_day}" if p.contract_day else ""
+    if p.product_type not in PRODUCT_TYPES_OPTION:
+        return f"{p.commodity} {p.product_type} {p.contract_month}{day}"
+    om = p.contract_month if p.option_month is None else p.option_month
+    oday = f"/{p.option_day}" if p.option_day else ""
+    return f"{p.commodity} {p.product_type} {p.contract_month}{day} {om}{oday} {p.right} {p.strike:g}"
 
 
 def scenario_losses(data: SpanData, positions: list[Position]) -> tuple[float, ...]:
@@ -217,16 +234,22 @@ def short_option_minimum(data: SpanData, positions: list[Position]) -> tuple[flo
     return n * data.delivery_som.som_rate * data.combined.risk_scale, n
 
 
-def option_values(data: SpanData, positions: list[Position]) -> tuple[float, float]:
-    """(long option value, short option value) = settlement price x contract value factor x |quantity|, for
-    premium-style options; futures-style options (Type 2 style "F") carry no option value."""
+def option_values(data: SpanData, positions: list[Position]) -> tuple[float, float, tuple[str, ...]]:
+    """(long option value, short option value, unpriced) — value = settlement price x contract value factor x
+    |quantity| for premium-style options; futures-style options (Type 2 style "F") carry no option value. An
+    option whose array has no settlement price (NaN, CME's all-nines field) is excluded from both sums and named
+    in `unpriced` with its quantity, so the caller sees what the net option value is missing."""
     if data.combined.option_margin_style == "F":
-        return 0.0, 0.0
+        return 0.0, 0.0, ()
     lov = sov = 0.0
+    unpriced: list[str] = []
     for p in positions:
         if p.product_type not in PRODUCT_TYPES_OPTION:
             continue
         a = _resolve(data, p)
+        if not a.has_settlement:
+            unpriced.append(f"{p.quantity:+g} x {_describe(p)}")
+            continue
         pp = data.price_params_for(a)
         cvf = pp.contract_value_factor if pp is not None else 1.0
         v = a.settlement_price * cvf * abs(p.quantity)
@@ -234,7 +257,7 @@ def option_values(data: SpanData, positions: list[Position]) -> tuple[float, flo
             lov += v
         else:
             sov += v
-    return lov, sov
+    return lov, sov, tuple(unpriced)
 
 
 def compute(data: SpanData, positions: list[Position]) -> SpanResult:
@@ -254,7 +277,10 @@ def compute(data: SpanData, positions: list[Position]) -> SpanResult:
     if data.delivery_som is None:
         notes.append("no Type 4 record: short option minimum 0")
     req = max(scan + intra + delivery - inter, som)
-    lov, sov = option_values(data, positions)
+    lov, sov, unpriced = option_values(data, positions)
+    if unpriced:
+        notes.append(f"net option value excludes {len(unpriced)} position(s) whose contract has no settlement price in the "
+                     f"file (CME all-nines field): {'; '.join(unpriced)}")
     nov = lov - sov
     im = ((data.intra_tiers.im_member, data.intra_tiers.im_hedger, data.intra_tiers.im_speculator)
           if data.intra_tiers is not None else (1.0, 1.0, 1.0))
@@ -308,12 +334,13 @@ def outright_table(data: SpanData, commodity: str, published: PublishedMargin | 
         futs = futs[:months]
     rows = []
     for a in futs:
-        long_scan, i_long = scan_risk(data, [Position(commodity, "FUT", a.contract_month, 1.0)])
-        short_scan, i_short = scan_risk(data, [Position(commodity, "FUT", a.contract_month, -1.0)])
+        long_scan, i_long = scan_risk(data, [Position(commodity, "FUT", a.contract_month, 1.0, contract_day=a.contract_day)])
+        short_scan, i_short = scan_risk(data, [Position(commodity, "FUT", a.contract_month, -1.0, contract_day=a.contract_day)])
         pl = published.long_margin if published else None
         ps = published.short_margin if published else None
         rows.append({
             "product": commodity, "combined_commodity": data.combined.code, "contract_month": a.contract_month,
+            "contract_day": a.contract_day,
             "settlement": a.settlement_price, "scan_long_1": long_scan, "active_long": i_long, "scan_short_1": short_scan,
             "active_short": i_short, "published_long": pl, "published_short": ps,
             "error_long": None if pl is None else long_scan - pl, "error_pct_long": None if not pl else 100.0 * (long_scan - pl) / pl,

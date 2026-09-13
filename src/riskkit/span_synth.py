@@ -8,6 +8,9 @@ the layout pages (see `span_files`), written out by hand here rather than derive
 so a parse-then-compare round trip checks the two against each other. Array values follow the convention
 of the real file: 5-digit magnitude then sign, loss-positive for long 1; the futures arrays are the
 standard SPAN shape (0, 0, -/+ 1/3, +/- 2/3, 3/3 and the 0.33 x 3 x scan extremes) at a 12,000 scan range.
+Two weekly calls share a month and strike and differ only in the option day/week code, so the fixture
+exercises the day-coded identity. The no-settlement sentinel, the high-precision flag and the CBT price
+alignment codes are covered by hand-typed lines in the tests, not here.
 """
 
 from __future__ import annotations
@@ -71,9 +74,10 @@ def _fut(month: int, settle: float) -> RiskArray:
     return RiskArray(EXCHANGE, FUT, FUT, "FUT", "", month, "", 0, "", 0.0, futures_array(SCAN), 1.0, 0.0, settle, settle, 1.0, "C")
 
 
-def _opt(right: str, fut_month: int, opt_month: int, strike: float, values, delta: float, iv: float, settle: float) -> RiskArray:
-    return RiskArray(EXCHANGE, OPT, FUT, "OOF", right, fut_month, "", opt_month, "", strike, tuple(float(v) for v in values), delta,
-                     iv, settle, settle, delta, "C")
+def _opt(right: str, fut_month: int, opt_month: int, strike: float, values, delta: float, iv: float, settle: float,
+         option_day: str = "") -> RiskArray:
+    return RiskArray(EXCHANGE, OPT, FUT, "OOF", right, fut_month, "", opt_month, option_day, strike, tuple(float(v) for v in values),
+                     delta, iv, settle, settle, delta, "C")
 
 
 def _bparams(commodity: str, ptype: str, fut_month: int, opt_month: int, base_vol: float, tte: float, expiry: str) -> ArrayParams:
@@ -125,6 +129,11 @@ def synthetic() -> SyntheticSpan:
         _opt("P", 202512, 202512, 3200.0, (-8, 6, 4, 9, -11, 2, 7, 12, -18, -3, 10, 14, -27, -9, 10, -30), -0.02, 0.21, 1.5),
         _opt("C", 202512, 202511, 3700.0, (-1200, 1000, -3300, -900, 900, 2600, -6100, -3600, 2200, 4200, -9300, -6800, 3300, 5300,
                                             -10800, 1900), 0.40, 0.151105, 60.0),
+        # two weekly calls on the same month and strike, told apart only by the option day/week code (81 cols 45-46)
+        _opt("C", 202512, 202511, 3700.0, (-900, 700, -2800, -600, 700, 2000, -5400, -2900, 1700, 3500, -8600, -6000, 2600, 4400,
+                                            -10300, 1500), 0.38, 0.152, 41.0, option_day="12"),
+        _opt("C", 202512, 202511, 3700.0, (-1100, 900, -3100, -800, 800, 2400, -5800, -3300, 2000, 3900, -9000, -6500, 3000, 4900,
+                                            -10600, 1700), 0.39, 0.1515, 52.5, option_day="19"),
     )
     arrays_other = (RiskArray(EXCHANGE, OTHER, OTHER, "FUT", "", 202512, "", 0, "", 0.0, futures_array(3000.0), 1.0, 0.0, 95.5, 95.5,
                               1.0, "C"),)

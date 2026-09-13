@@ -23,7 +23,7 @@ from .positions import Book, LegMark, Market, mark
 from .stress import HISTORICAL_SCENARIOS, ladder, reverse_stress_spot, reverse_stress_vol
 from .var import VaRResult, all_methods, fhs_var, historical_var, monte_carlo_var, parametric_var
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "Book", "LegMark", "Market", "mark", "VaRResult", "historical_var", "parametric_var", "monte_carlo_var", "fhs_var",
     "all_methods", "TestResult", "kupiec_pof", "kupiec_size", "kupiec_power", "christoffersen_independence",

@@ -6,7 +6,9 @@ here is at the column both agree on. The real-file check that pins the columns t
 test_span_private.py (skipped when the private slice is absent).
 """
 
+import dataclasses
 import filecmp
+import math
 import zipfile
 from pathlib import Path
 
@@ -35,6 +37,25 @@ FIXTURE = REPO / "tests/fixtures/span_synthetic.pa2"
 @pytest.fixture(scope="module")
 def data() -> sf.SpanData:
     return sf.load_commodity(FIXTURE, FUT)
+
+
+def _pp(commodity: str, product_type: str, settlement_decimals: int = 0, strike_decimals: int = 0,
+        settlement_alignment: str = "", strike_alignment: str = "", cvf: float = 100.0) -> sf.PriceParams:
+    return sf.PriceParams(EXCHANGE, commodity, product_type, "SYN", settlement_decimals, strike_decimals, cvf, 0.0, "USD", "STD",
+                          "AMER", "SYNTHETIC", "EQTY", "DELIV", settlement_alignment, strike_alignment)
+
+
+def _option_pair(right: str, strike7: str, settle7: str, hp14: str, flag: str, option_day: str = "  ") -> tuple[str, str]:
+    """A hand-typed 81/82 pair for a fictional OZ option on ZZ (Dec-25 future, Nov-25 option) at CME's columns:
+    identity cols 1-54, nine values from col 55, hp settlement cols 109-122 + flag 123 (81); seven values from
+    col 55, composite delta 97-102, implied vol 103-110, settlement 111-118, strike sign 119, current delta
+    120-125, flag 126 (82)."""
+    ident = "81XYZOZ        ZZ        OOF" + right + "202512  " + " " + "202511" + option_day + " " + strike7
+    assert len(ident) == 54 and len(strike7) == 7 and len(settle7) == 7 and len(hp14) == 14 and len(option_day) == 2
+    l81 = ident + "01200-01000+03300-00900+00900-02600+06100-03600-02200+" + hp14 + flag
+    l82 = "82" + ident[2:] + "04200-09300+06800-03300+05300+10800-01900+" + "04000+" + "00151105" + settle7 + "+" + "+" + "04000+" + "C"
+    assert len(l81) == 123 and len(l82) == 126
+    return l81, l82
 
 
 def test_synthetic_fixture_regenerates_byte_identically(tmp_path):
@@ -90,7 +111,7 @@ def test_array_value_columns_and_trailing_sign():
     assert len(ident) == 54
     l81 = ident + "00000+00000+04000-04000-04000+04000+08000-08000-08000+" + "00000000364000" + "N"
     l82 = "82" + ident[2:] + "08000+12000-12000-12000+12000+11880-11880+" + "10000+" + "00000000" + "0364000" + "+" + "+" + "10000+" + "C"
-    a = sf.parse_risk_array_pair(l81, l82, strike_decimals=0, settlement_decimals=2)
+    a = sf.parse_risk_array_pair(l81, l82, _pp("ZZ", "FUT", settlement_decimals=2))
     assert a.values == (0, 0, -4000, -4000, 4000, 4000, -8000, -8000, 8000, 8000, -12000, -12000, 12000, 12000, -11880, 11880)
     assert l81[54:59] == "00000" and l81[59] == "+" and l81[66:71] == "04000" and l81[71] == "-"   # cols 55-59 / 60, 67-71 / 72
     assert a.composite_delta == 1.0 and a.settlement_price == 3640.0 and a.hp_settlement_price == 3640.0 and a.delta_flag == "C"
@@ -156,3 +177,74 @@ def test_extract_slice_reproduces_the_loadable_subset(tmp_path):
     assert sliced.combined == full.combined and sliced.header == full.header and sliced.price_params == full.price_params
     lines = out.read_text(encoding="latin-1").splitlines()
     assert not any(x.startswith("81XYZYY") for x in lines) and not any(x.startswith("2 XYZ CC-YY") for x in lines)
+
+
+def test_no_settlement_sentinel_reads_as_nan_not_as_a_price():
+    """CME writes all nines in the 82 settlement field (cols 111-117) and the 81 high-precision field when a contract
+    has no settlement price (24,349 option records on 2025-09-12). Both read as NaN; nothing else on the pair changes."""
+    l81, l82 = _option_pair("P", "0000800", "9999999", "00000009999999", "N")
+    a = sf.parse_risk_array_pair(l81, l82, _pp(OPT, "OOF", settlement_decimals=3, strike_decimals=1))
+    assert math.isnan(a.settlement_price) and math.isnan(a.hp_settlement_price) and not a.has_settlement
+    assert a.strike == 80.0 and a.composite_delta == 0.4 and a.values[0] == -1200 and a.values[15] == 1900
+    priced = sf.parse_risk_array_pair(*_option_pair("P", "0000800", "0000123", "00000000000123", "N"),
+                                      _pp(OPT, "OOF", settlement_decimals=3, strike_decimals=1))
+    assert priced.settlement_price == priced.hp_settlement_price == 0.123 and priced.has_settlement
+    assert sf.SETTLEMENT_MISSING == 9_999_999
+
+
+def test_high_precision_flag_y_takes_the_price_from_the_81_field():
+    """Flag "Y" at 81 col 123 means the regular field is zero and the price can only be read from cols 109-122
+    (2,736 records on 2025-09-12; a price that needs more than 7 digits). Flag "N": the two fields agree."""
+    pp = _pp(OPT, "OOF", settlement_decimals=2, strike_decimals=0)
+    y = sf.parse_risk_array_pair(*_option_pair("P", "0220000", "0000000", "00000010257000", "Y"), pp)
+    assert y.settlement_price == 102570.0 and y.hp_settlement_price == 102570.0
+    n = sf.parse_risk_array_pair(*_option_pair("P", "0220000", "0010740", "00000000010740", "N"), pp)
+    assert n.settlement_price == 107.4 and n.hp_settlement_price == 107.4
+    y_missing = sf.parse_risk_array_pair(*_option_pair("P", "0220000", "0000000", "00000009999999", "Y"), pp)
+    assert math.isnan(y_missing.settlement_price)
+
+
+def test_alignment_codes_decode_32nds_64ths_and_eighths():
+    """P cols 40/41. Values pinned by put-call parity on the 2025-09-12 file: ZB Dec-25 future 117-13 (raw 0117130,
+    code C) is 117.40625 and the Nov-25 114 call 3-54/64 (raw 0003540, code K) is 3.84375 — C-P = F-K exactly
+    at 116-119; corn Mar-26 447'2 (raw 0004472, code 0) is 4.4725 $/bu; the 3-year note 106-16.125 (raw 0106161)
+    carries the eighths sub-tick digit; ZN quarter strikes 112.25 (raw 0001122 under a 1-digit locator, blank
+    strike code in a K family) are exact only with the eighths digit. Digits 4 and 9 and unknown codes raise."""
+    assert sf.aligned_price(117130, 3, "C") == 117.40625 and sf.aligned_price(3540, 3, "K") == 3.84375
+    assert sf.aligned_price(106161, 3, "C") == 106 + 16.125 / 32 and sf.aligned_price(80247, 3, "C") == 80 + 24.75 / 32
+    assert sf.aligned_price(4472, 3, "0") == 4.4725 and sf.aligned_price(4597, 3, "0") == 4.5975 and sf.aligned_price(188, 3, "0") == 0.18875
+    assert sf.aligned_price(1122, 1, "0") == 112.25 and sf.aligned_price(1127, 1, "0") == 112.75 and sf.aligned_price(10412, 2, "0") == 104.125
+    assert sf.aligned_price(117130, 3, "") == 117.13 and sf.aligned_price(0, 3, "K") == 0.0 and sf.aligned_price(1145, 1, "0") == 114.5
+    assert sf.aligned_price(0, 0, "C") == 0.0      # the CBT Treasury combination placeholders: code C, 0-digit locator, price 0
+    for raw, dec, code in ((117134, 3, "C"), (4479, 3, "0"), (117130, 3, "Q"), (117130, 2, "C"), (4472, 0, "0")):
+        with pytest.raises(ValueError):
+            sf.aligned_price(raw, dec, code)
+    # a P record carrying the codes, and a pair decoded with it: strike 1122 -> 112.25, settlement 0003540 -> 3.84375
+    p = sf.parse_price_params("P XYZOZ        OOFSYN TREASURY OP003001K 00010000000000" + "00000000" + "01USD$STD 00AMER")
+    assert (p.settlement_decimals, p.strike_decimals, p.settlement_alignment, p.strike_alignment) == (3, 1, "K", "")
+    assert p.strike_format == "0" and p.contract_value_factor == 1000.0
+    a = sf.parse_risk_array_pair(*_option_pair("C", "0001122", "0003540", "00000000003540", "N"), p)
+    assert a.strike == 112.25 and a.settlement_price == 3.84375 and a.hp_settlement_price == 3.84375
+    assert _pp(OPT, "OOF", settlement_alignment="0").strike_format == "" and _pp(OPT, "OOF", strike_alignment="9").strike_format == "9"
+    with pytest.raises(ValueError, match="unknown price alignment code"):
+        sf.parse_risk_array_pair(*_option_pair("C", "0001122", "0003540", "00000000003540", "N"),
+                                 _pp(OPT, "OOF", settlement_decimals=3, strike_decimals=1, strike_alignment="9"))
+    assert sf.LAYOUT["P "]["settlement_alignment"] == (40, 40) and sf.LAYOUT["P "]["strike_alignment"] == (41, 41)
+
+
+def test_day_week_codes_are_part_of_the_identity(data):
+    """Two weekly 3700 Nov calls in the fixture differ only in the option day code (81 cols 45-46): both load, both
+    resolve by day, and the monthly one is what a day-less `find` returns. A duplicate identity refuses to load."""
+    monthly = data.find(OPT, "OOF", 202512, "C", 3700.0, option_month=202511)
+    w12 = data.find(OPT, "OOF", 202512, "C", 3700.0, option_month=202511, option_day="12")
+    w19 = data.find(OPT, "OOF", 202512, "C", 3700.0, option_month=202511, option_day="19")
+    assert (monthly.option_day, w12.option_day, w19.option_day) == ("", "12", "19")
+    assert (monthly.settlement_price, w12.settlement_price, w19.settlement_price) == (60.0, 41.0, 52.5)
+    assert len(data._index) == len(data.arrays) and monthly.key[:3] == w12.key[:3] and monthly.key != w12.key
+    with pytest.raises(KeyError, match="no risk array"):
+        data.find(OPT, "OOF", 202512, "C", 3700.0, option_month=202511, option_day="26")
+    dup = dataclasses.replace(w12, settlement_price=1.0)
+    with pytest.raises(ValueError, match="share the identity"):
+        dataclasses.replace(data, arrays=data.arrays + [dup])
+    l81, l82 = _option_pair("C", "0003700", "0000410", "00000000000410", "N", option_day="12")
+    assert sf.parse_risk_array_pair(l81, l82, _pp(OPT, "OOF", settlement_decimals=1)).key == w12.key

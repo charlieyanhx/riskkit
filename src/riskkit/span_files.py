@@ -17,7 +17,17 @@ Units and conventions
   15 up extreme x cover fraction, 16 down extreme x cover fraction.
 - Composite delta (82 cols 97-101 + sign col 102): 9V9(4), a future is +1.0000, puts are negative.
 - Strike (cols 48-54) and settlement price (82 cols 111-117 + sign col 118) are integers with the decimal
-  locators of the product family's Type P record (cols 34-36 settlement, 37-39 strike).
+  locators of the product family's Type P record (cols 34-36 settlement, 37-39 strike) and its price
+  alignment codes (cols 40 settlement, 41 strike) — see `aligned_price` for the non-decimal formats CBT
+  Treasuries and grains use. Three facts about the settlement field, all measured on the 2025-09-12 file
+  and none printed on the layout page: all nines (`9999999`) means there is no settlement price
+  (24,349 option records that day; `settlement_price` is NaN and `span.option_values` refuses to price
+  the contract); when the 81 line's high-precision flag (col 123) is "Y" the regular field is zero and the
+  price is only in the 14-digit field at cols 109-122 (2,736 records); otherwise the two fields agree.
+- A contract's identity is (exchange, commodity, product type, right, futures month AND day/week code,
+  option month AND day/week code, signed strike): 604,160 pairs are distinct on it and 39,888 collide
+  without the day codes (dailies, weeklies, flex). `RiskArray.key` keeps both codes and `SpanData` refuses
+  a duplicate rather than overwriting it.
 - Lines may be shorter than the layout: CME truncates trailing blanks. A missing numeric field reads as 0,
   a missing sign as "+", a missing text field as "".
 - Months are ints CCYYMM; Type E months are YYMM in the file and are expanded to 20YYMM here.
@@ -30,6 +40,7 @@ naming it. It never holds the 1.2 million risk-array lines of a full CME file at
 from __future__ import annotations
 
 import io
+import math
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,7 +113,8 @@ LAYOUT: dict[str, dict[str, tuple[int, int]]] = {
     },
     "P ": {  # price conversion parameters per product family
         "exchange": (3, 5), "commodity": (6, 15), "product_type": (16, 18), "short_name": (19, 33),
-        "settlement_decimals": (34, 36), "strike_decimals": (37, 39), "contract_value_factor": (42, 55),
+        "settlement_decimals": (34, 36), "strike_decimals": (37, 39), "settlement_alignment": (40, 40),
+        "strike_alignment": (41, 41), "contract_value_factor": (42, 55),
         "cabinet_value": (56, 63), "settlement_currency": (66, 68), "price_quotation": (70, 72),
         "cvf_exponent_sign": (73, 73), "cvf_exponent": (74, 75), "exercise_style": (76, 79), "long_name": (80, 114),
         "valuation_method": (117, 121), "settlement_method": (122, 126),
@@ -128,6 +140,9 @@ LAYOUT: dict[str, dict[str, tuple[int, int]]] = {
 SIGN_COL_AFTER_VALUE = 1   # each array value's sign is the character immediately after its 5 digits
 N_SCENARIOS = 16
 PRODUCT_TYPES_OPTION = ("OOF", "OOP", "OOC")
+SETTLEMENT_MISSING = 9_999_999      # all nines in the 82 settlement field (and the 81 high-precision field): no price
+ALIGNMENT_TICKS = {"C": 32, "K": 64}   # settlement alignment code -> ticks per point (CBT Treasury futures / options)
+_SUBTICK_EIGHTHS = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4, 6: 5, 7: 6, 8: 7}   # truncated first decimal of k/8 -> k
 
 
 # --- slicing helpers -------------------------------------------------------------------------------------------
@@ -163,6 +178,40 @@ def _locator(line: str, rec: str, name: str) -> int:
     """Decimal locator 9(3) with an optional leading '-' ("-02" means -2)."""
     t = _s(line, rec, name).strip()
     return int(t) if t else 0
+
+
+def aligned_price(raw: int, decimals: int, code: str = "") -> float:
+    """A price integer from the file, with its decimal locator and P-record alignment code, as a decimal price.
+
+    CME's layout page says only that the codes "code for particular non-decimal price formats"; these are the
+    three on the 2025-09-12 file, each pinned by put-call parity on the file's own chains (see the tests):
+    blank — decimal, raw / 10**decimals;
+    "0"   — decimal whose last digit is a truncated eighth (CBT grains: corn 447'2 = 447.25 cents is written
+            4472 with a 3-digit locator and means 4.4725 $/bu);
+    "C"   — points and 32nds (Treasury futures: 117130 is 117 + 13.0/32 = 117.40625);
+    "K"   — points and 64ths (Treasury options: 3540 is 3 + 54.0/64 = 3.84375).
+    Under every code the final digit is the fraction of a tick written as the truncated first decimal of k/8:
+    0 1 2 3 5 6 7 8 stand for 0/8 .. 7/8 (the 3-year note's 106161 is 106 + 16.125/32), so 4 and 9 cannot occur
+    and raise. "C"/"K" need the 3-digit locator (two tick digits then the sub-tick digit) every such family has.
+    Any other code raises: a price read under the wrong format is wrong by up to half a point, not approximate.
+    A zero magnitude is 0 under every format (the CBT Treasury combination placeholders carry code "C" with a
+    0-digit locator and a zero price).
+    """
+    if code == "" or raw == 0:
+        return raw / 10**decimals
+    if code not in ("0", "C", "K"):
+        raise ValueError(f"unknown price alignment code {code!r} (known: blank, '0', 'C', 'K')")
+    sub = _SUBTICK_EIGHTHS.get(raw % 10)
+    if sub is None:
+        raise ValueError(f"price {raw} under alignment code {code!r}: last digit {raw % 10} is not a truncated eighth")
+    if code == "0":
+        if decimals < 1:
+            raise ValueError(f"alignment code '0' needs a decimal locator >= 1, got {decimals}")
+        return (raw // 10 + sub / 8) / 10 ** (decimals - 1)
+    if decimals != 3:
+        raise ValueError(f"alignment code {code!r} expects a 3-digit locator (two tick digits + sub-tick), got {decimals}")
+    whole, frac = divmod(raw, 1000)
+    return whole + (frac // 10 + sub / 8) / ALIGNMENT_TICKS[code]
 
 
 # --- records ----------------------------------------------------------------------------------------------------
@@ -311,10 +360,23 @@ class PriceParams:
     long_name: str
     valuation_method: str
     settlement_method: str
+    settlement_alignment: str = ""      # P col 40: blank decimal, "0" eighths last digit, "C" 32nds, "K" 64ths
+    strike_alignment: str = ""          # P col 41; blank on every family with risk arrays in the 2025-09-12 file
 
     @property
     def key(self) -> tuple[str, str, str]:
         return (self.exchange, self.commodity, self.product_type)
+
+    @property
+    def strike_format(self) -> str:
+        """Alignment code that decodes the strike: the strike code when the file gives one; otherwise "0" in a
+        32nds/64ths family with a fractional strike locator — Treasury option strikes are points with the same
+        truncated-eighths last digit (ZN 112.25 is written 1122 under a 1-digit locator; parity is exact only
+        read that way) — and decimal elsewhere (grain strikes are whole cents and do use the digits 4 and 9; a
+        0-digit locator, as on the futures families, has no fractional digit to reinterpret)."""
+        if self.strike_alignment:
+            return self.strike_alignment
+        return "0" if self.settlement_alignment in ALIGNMENT_TICKS and self.strike_decimals >= 1 else ""
 
 
 @dataclass(frozen=True)
@@ -346,21 +408,26 @@ class RiskArray:
     product_type: str           # FUT, OOF, OOP, PHY, CMB, OOC
     right: str                  # "C" / "P" / ""
     contract_month: int         # CCYYMM of the future (for an option: its underlying future's month)
-    contract_day: str
+    contract_day: str           # futures day/week code (81 cols 36-37), "" for a plain monthly contract
     option_month: int           # CCYYMM, 0 for a future
-    option_day: str
+    option_day: str             # option day/week code (81 cols 45-46): dailies, weeklies, flex
     strike: float
     values: tuple[float, ...]   # 16 scenario values, loss-positive for long 1, in PB currency (risk_scale applied)
     composite_delta: float
     implied_vol: float          # decimal fraction (0.15 = 15 %)
-    settlement_price: float     # price units (decimal locator applied)
-    hp_settlement_price: float
+    settlement_price: float     # price units (locator and alignment code applied); NaN when the file has no price
+    hp_settlement_price: float  # the 81 line's high-precision field, same units; NaN when all nines
     current_delta: float
     delta_flag: str
 
     @property
-    def key(self) -> tuple[str, str, int, int, str, float]:
-        return (self.commodity, self.product_type, self.contract_month, self.option_month, self.right, self.strike)
+    def key(self) -> tuple[str, str, int, str, int, str, str, float]:
+        return (self.commodity, self.product_type, self.contract_month, self.contract_day, self.option_month,
+                self.option_day, self.right, self.strike)
+
+    @property
+    def has_settlement(self) -> bool:
+        return not math.isnan(self.settlement_price)
 
     @property
     def is_option(self) -> bool:
@@ -462,7 +529,7 @@ def parse_price_params(line: str) -> PriceParams:
                        _text(line, r, "short_name"), _locator(line, r, "settlement_decimals"), _locator(line, r, "strike_decimals"),
                        cvf, _dec(line, r, "cabinet_value", 2), _text(line, r, "settlement_currency"), _text(line, r, "price_quotation"),
                        _text(line, r, "exercise_style") or "AMER", _text(line, r, "long_name"), _text(line, r, "valuation_method"),
-                       _text(line, r, "settlement_method"))
+                       _text(line, r, "settlement_method"), _text(line, r, "settlement_alignment"), _text(line, r, "strike_alignment"))
 
 
 def parse_inter_spread(line: str) -> InterSpread:
@@ -480,23 +547,39 @@ def identity_8(line: str) -> tuple:
     return tuple(_text(line, r, k) for k in _IDENTITY_8)
 
 
-def parse_risk_array_pair(l81: str, l82: str, strike_decimals: int = 0, settlement_decimals: int = 0,
-                          risk_scale: float = 1.0) -> RiskArray:
-    """An 81 line and its 82 line -> one contract's `RiskArray`. Raises if the two identities differ."""
+def _settlement_prices(l81: str, l82: str, decimals: int, code: str) -> tuple[float, float]:
+    """(settlement price, high-precision settlement price) with the 82 sign, NaN where the field is all nines.
+    With the 81 flag "Y" the regular field is zero and the price is the high-precision one."""
+    sign = -1.0 if _text(l82, "82", "settlement_sign") == "-" else 1.0
+    regular, hp = _int(l82, "82", "settlement"), _int(l81, "81", "hp_settlement")
+    hp_price = math.nan if hp == SETTLEMENT_MISSING else sign * aligned_price(hp, decimals, code)
+    if _text(l81, "81", "hp_settlement_flag") == "Y":
+        return hp_price, hp_price
+    price = math.nan if regular == SETTLEMENT_MISSING else sign * aligned_price(regular, decimals, code)
+    return price, hp_price
+
+
+def parse_risk_array_pair(l81: str, l82: str, price_params: PriceParams | None = None, risk_scale: float = 1.0) -> RiskArray:
+    """An 81 line and its 82 line -> one contract's `RiskArray`. Raises if the two identities differ. Strike and
+    settlement are decoded with the family's P record (locators and alignment codes); without one they are read
+    as plain integers."""
     if l81[:2] != "81" or l82[:2] != "82":
         raise ValueError(f"expected an 81 line then an 82 line, got {l81[:2]!r} then {l82[:2]!r}")
     if identity_8(l81) != identity_8(l82):
         raise ValueError(f"81/82 identity mismatch: {identity_8(l81)} vs {identity_8(l82)}")
+    pp = price_params
+    strike_decimals, settle_decimals = (pp.strike_decimals, pp.settlement_decimals) if pp else (0, 0)
+    strike_code, settle_code = (pp.strike_format, pp.settlement_alignment) if pp else ("", "")
     vals = [_signed_after(l81, "81", f"v{i}") for i in range(1, 10)] + [_signed_after(l82, "82", f"v{i}") for i in range(10, 17)]
-    strike = _int(l81, "81", "strike") / 10**strike_decimals
+    strike = aligned_price(_int(l81, "81", "strike"), strike_decimals, strike_code)
     if _text(l82, "82", "strike_sign") == "-":
         strike = -strike
+    settlement, hp_settlement = _settlement_prices(l81, l82, settle_decimals, settle_code)
     return RiskArray(
         _text(l81, "81", "exchange"), _text(l81, "81", "commodity"), _text(l81, "81", "underlying"), _text(l81, "81", "product_type"),
         _text(l81, "81", "right"), _int(l81, "81", "contract_month"), _text(l81, "81", "contract_day"), _int(l81, "81", "option_month"),
         _text(l81, "81", "option_day"), strike, tuple(v * risk_scale for v in vals),
-        _signed_after(l82, "82", "composite_delta", 4), _dec(l82, "82", "implied_vol", 6),
-        _signed_after(l82, "82", "settlement", settlement_decimals), _int(l81, "81", "hp_settlement") / 10**settlement_decimals,
+        _signed_after(l82, "82", "composite_delta", 4), _dec(l82, "82", "implied_vol", 6), settlement, hp_settlement,
         _signed_after(l82, "82", "current_delta", 4), _text(l82, "82", "delta_flag"),
     )
 
@@ -536,12 +619,19 @@ class SpanData:
     _index: dict[tuple, RiskArray] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        self._index = {a.key: a for a in self.arrays}
+        self._index = {}
+        for a in self.arrays:
+            if a.key in self._index:
+                raise ValueError(f"{self.combined.code}: two risk arrays share the identity {a.key}; a contract would be "
+                                 "silently overwritten (the day/week codes are part of the identity — check the file)")
+            self._index[a.key] = a
 
     def find(self, commodity: str, product_type: str, contract_month: int, right: str = "", strike: float = 0.0,
-             option_month: int | None = None) -> RiskArray:
+             option_month: int | None = None, contract_day: str = "", option_day: str = "") -> RiskArray:
+        """The contract's array. Options default `option_month` to the futures month; dailies, weeklies and flex
+        contracts need their day/week code (81 cols 36-37 / 45-46) as `contract_day` / `option_day`."""
         om = 0 if product_type == "FUT" else (contract_month if option_month is None else option_month)
-        key = (commodity, product_type, contract_month, om, right, float(strike))
+        key = (commodity, product_type, contract_month, contract_day, om, option_day, right, float(strike))
         try:
             return self._index[key]
         except KeyError:
@@ -629,9 +719,7 @@ def load_commodity(path: str | Path, commodity: str, exchange: str | None = None
                 continue
             key = (_text(line, "82", "exchange"), _text(line, "82", "commodity"), _text(line, "82", "product_type"))
             if key in wanted:
-                pp = price_params.get(key)
-                arrays.append(parse_risk_array_pair(pending81, line, pp.strike_decimals if pp else 0,
-                                                    pp.settlement_decimals if pp else 0, cc.risk_scale))
+                arrays.append(parse_risk_array_pair(pending81, line, price_params.get(key), cc.risk_scale))
             pending81 = None
         elif rec == "6 " and cc is not None:
             sp = parse_inter_spread(line)
