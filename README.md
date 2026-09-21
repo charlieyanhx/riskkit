@@ -284,6 +284,10 @@ review agent and the evals that measure it ·
 [deskboard](https://github.com/charlieyanhx/deskboard) — real-time options risk / P&L
 dashboard whose book schema and pricer API this repo shares ·
 [pricers](https://github.com/charlieyanhx/pricers) — option pricers, a drop-in for
-`riskkit.pricing`.
+`riskkit.pricing` ·
+[tickq](https://github.com/charlieyanhx/tickq) — DuckDB market-data SQL: partitioned Parquet lake, ASOF
+joins with the tie rule stated, quality checks with recall and precision ·
+[lobcore](https://github.com/charlieyanhx/lobcore) — bounded-array limit order book in Rust with a
+reference-book differential test, ITCH 5.0 replay and PyO3 bindings.
 
 MIT © Hanxiong (Charlie) Yan
